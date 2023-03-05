@@ -641,12 +641,16 @@ ClientSend(
 
     char str[] = "Hello\0";
     // send hello payload to the right location
+#ifdef WIN32
     errno_t ec = memcpy_s(SendBufferRaw+sizeof(QUIC_BUFFER),SendBufferLength, str, sizeof(str));
     if(ec != 0){
         printf("SendBuffer fail to copy payload!\n");
         Status = QUIC_STATUS_OUT_OF_MEMORY;
         goto Error;
     }
+#else
+    memcpy(SendBufferRaw+sizeof(QUIC_BUFFER), str, sizeof(str));
+#endif
 
     SendBuffer = (QUIC_BUFFER*)SendBufferRaw;
     SendBuffer->Buffer = SendBufferRaw + sizeof(QUIC_BUFFER);

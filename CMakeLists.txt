@@ -1,18 +1,28 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.16)
 
 project(msquic-asio)
 
-# find nuget
-find_program(nuget_exe
-  NAMES nuget
-  REQUIRED
+if(WIN32)
+  set(release_url "https://github.com/microsoft/msquic/releases/download/v2.1.7/msquic_windows_x64_Release_schannel.zip")
+else()
+  # linux
+  set(release_url "https://github.com/microsoft/msquic/releases/download/v2.1.7/msquic_linux_x64_Release_openssl.zip")
+  find_package(OpenSSL REQUIRED)
+  # openssl needs version 1.1. ubuntu 20.04 has it, 22.04 is too new.
+endif(WIN32)
+
+message(STATUS "fetching msquic_release " ${release_url})
+include(FetchContent)
+FetchContent_Declare(
+  msquic_release
+  DOWNLOAD_EXTRACT_TIMESTAMP true
+  URL ${release_url}
 )
 
-# download msquic nuget
-add_custom_target(nuget_install_msquic
-  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-  COMMAND ${nuget_exe} install Microsoft.Native.Quic.MsQuic.Schannel -Version 2.1.7 -DirectDownload -OutputDirectory ./nuget
-)
+FetchContent_GetProperties(msquic_release)
+if(NOT msquic_release_POPULATED)
+  FetchContent_Populate(msquic_release)
+endif()
 
 # download msquic cpp headers
 set(_h_files
@@ -35,29 +45,53 @@ endforeach()
 # import msquic as a cmake lib
 add_library(msquic SHARED IMPORTED GLOBAL)
 
-set(_msquic_dll ${CMAKE_CURRENT_BINARY_DIR}/nuget/Microsoft.Native.Quic.MsQuic.Schannel.2.1.7/build/native/bin/x64/msquic.dll)
-
+if(WIN32)
+set(_msquic_dll ${msquic_release_SOURCE_DIR}/bin/msquic.dll)
 set_target_properties(msquic PROPERTIES
     IMPORTED_LOCATION ${_msquic_dll}
-    IMPORTED_IMPLIB ${CMAKE_CURRENT_BINARY_DIR}/nuget/Microsoft.Native.Quic.MsQuic.Schannel.2.1.7/build/native/lib/x64/msquic.lib
+    IMPORTED_IMPLIB ${msquic_release_SOURCE_DIR}/lib/msquic.lib
 )
+else()
+set(_msquic_dll ${msquic_release_SOURCE_DIR}/bin/libmsquic.so.2.1.7)
+set_target_properties(msquic PROPERTIES
+    IMPORTED_LOCATION ${_msquic_dll}
+)
+endif(WIN32)
 
 target_include_directories(msquic
-  INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/nuget/Microsoft.Native.Quic.MsQuic.Schannel.2.1.7/build/native/include
+  INTERFACE ${msquic_release_SOURCE_DIR}/include
   INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/inc
 )
 
 # compile the example
 add_executable(quicsample
   example/sample.c
-)
-
-target_link_libraries(quicsample
-  PUBLIC msquic
+  example/inline.c
 )
 
 # copy dll into the exe dir so that exe can run
+if(WIN32)
+target_link_libraries(quicsample
+  PUBLIC msquic
+)
 add_custom_command(TARGET quicsample POST_BUILD
     COMMAND ${CMAKE_COMMAND} 
         -E copy_if_different ${_msquic_dll} ${CMAKE_CURRENT_BINARY_DIR}/Debug
 )
+else()
+target_link_libraries(quicsample
+  PUBLIC msquic
+  OpenSSL::Crypto
+)
+add_custom_command(TARGET quicsample POST_BUILD
+    COMMAND ${CMAKE_COMMAND} 
+        -E copy_if_different ${_msquic_dll} ${CMAKE_CURRENT_BINARY_DIR}/libmsquic.so.2
+)
+endif()
+
+# Get cert hash Get-ChildItem Cert:\CurrentUser\My
+# .\build\Debug\quicsample.exe -server -cert_hash:
+# .\build\Debug\quicsample.exe -client -unsecure -target:localhost
+
+# linux:
+# LD_LIBRARY_PATH=./build/_deps/msquic_release-src/bin ./build/quicsample
