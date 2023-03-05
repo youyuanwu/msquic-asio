@@ -95,3 +95,37 @@ endif()
 
 # linux:
 # LD_LIBRARY_PATH=./build/_deps/msquic_release-src/bin ./build/quicsample
+
+# msquic-asio lib
+set(Boost_USE_STATIC_LIBS ON) # use static boost
+find_package(Boost REQUIRED)
+
+file(GLOB_RECURSE MSQUIC_ASIO_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp)
+
+if(WIN32)
+  add_library(msquic-asio INTERFACE ${MSQUIC_ASIO_SOURCES})
+  # good practice
+  target_compile_options(msquic-asio
+  INTERFACE /W4 /WX
+  )
+else()
+  #linux does not like sources for interface lib
+  add_library(msquic-asio INTERFACE)
+endif()
+
+target_include_directories(msquic-asio INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# header only
+target_compile_definitions(msquic-asio
+    INTERFACE _WIN32_WINNT=0x0601
+)
+
+# currently winasio uses boost log for logging
+target_link_libraries(msquic-asio
+    INTERFACE Boost::disable_autolinking Boost::headers
+)
+
+enable_testing()
+add_subdirectory(tests)
