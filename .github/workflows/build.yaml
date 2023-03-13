@@ -8,7 +8,7 @@ jobs:
     strategy:
       matrix:
         BUILD_TYPE: ["Debug", "Release"]
-        os: [ windows-latest, ubuntu-20.04]
+        os: [ windows-latest ] # ubuntu-20.04 is disabled until dependency is easier
         BOOST_VERSION: [ 1.79.0 ]
     steps:
     - uses: actions/checkout@v2

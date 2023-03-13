@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 
 project(msquic-asio)
 
+include(cmake/clang-format.cmake)
+
 if(WIN32)
   set(release_url "https://github.com/microsoft/msquic/releases/download/v2.1.7/msquic_windows_x64_Release_schannel.zip")
 else()
@@ -125,6 +127,7 @@ target_compile_definitions(msquic-asio
 # currently winasio uses boost log for logging
 target_link_libraries(msquic-asio
     INTERFACE Boost::disable_autolinking Boost::headers
+    INTERFACE msquic
 )
 
 enable_testing()
