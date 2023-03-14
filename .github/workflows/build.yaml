@@ -45,14 +45,15 @@ jobs:
         platform_version: 20.04
         link: static
     
-    # - name: Get OpenCppCoverage
-    #   if: ${{ matrix.BUILD_TYPE == 'Debug' }}
-    #   env:
-    #     myUrl: "https://github.com/OpenCppCoverage/OpenCppCoverage/releases/download/release-0.9.9.0/OpenCppCoverageSetup-x64-0.9.9.0.exe"
-    #   run: |
-    #     powershell.exe -Command "Invoke-WebRequest $env:myUrl -OutFile $env:Temp/OpenCppCoverageSetup-x64-0.9.9.0.exe"
-    #     powershell.exe -Command "& $env:Temp/OpenCppCoverageSetup-x64-0.9.9.0.exe /silent"
-    #     powershell.exe -Command "Add-Content $env:GITHUB_PATH 'C:\Program Files\OpenCppCoverage'"
+    - name: Get OpenCppCoverage
+      if: ${{ matrix.BUILD_TYPE == 'Debug' }}
+      env:
+        myUrl: "https://github.com/OpenCppCoverage/OpenCppCoverage/releases/download/release-0.9.9.0/OpenCppCoverageSetup-x64-0.9.9.0.exe"
+      run: |
+        powershell.exe -Command "Invoke-WebRequest $env:myUrl -OutFile $env:Temp/OpenCppCoverageSetup-x64-0.9.9.0.exe"
+        powershell.exe -Command "& $env:Temp/OpenCppCoverageSetup-x64-0.9.9.0.exe /silent"
+        powershell.exe -Command "Add-Content $env:GITHUB_PATH 'C:\Program Files\OpenCppCoverage'"
+
     - name: run cmake
       env:
         BOOST_ROOT: ${{ steps.install-boost.outputs.BOOST_ROOT }}${{ steps.install-boost1.outputs.BOOST_ROOT }}
@@ -65,15 +66,15 @@ jobs:
     - name: run test
       run: ctest -C ${{ matrix.BUILD_TYPE }} --test-dir build --verbose --repeat until-pass:3 --timeout 30
 
-    # - name: run test with coverage
-    #   if: ${{ matrix.BUILD_TYPE == 'Debug' }}
-    #   run: >
-    #     cmake --build build --config ${{ matrix.BUILD_TYPE }} --target coverage
+    - name: run test with coverage
+      if: ${{ matrix.BUILD_TYPE == 'Debug' }}
+      run: >
+        cmake --build build --config ${{ matrix.BUILD_TYPE }} --target coverage
     
-    # - name: Upload Report to Codecov
-    #   if: ${{ matrix.BUILD_TYPE == 'Debug' }}
-    #   uses: codecov/codecov-action@v2
-    #   with:
-    #     files: ./cobertura.xml
-    #     fail_ci_if_error: true
-    #     functionalities: fix
+    - name: Upload Report to Codecov
+      if: ${{ matrix.BUILD_TYPE == 'Debug' }}
+      uses: codecov/codecov-action@v2
+      with:
+        files: ./cobertura.xml
+        fail_ci_if_error: true
+        functionalities: fix

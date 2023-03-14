@@ -26,24 +26,6 @@ if(NOT msquic_release_POPULATED)
   FetchContent_Populate(msquic_release)
 endif()
 
-# download msquic cpp headers
-set(_h_files
-    msquic.hpp
-    msquicp.h # needed by hpp header
-)
-
-foreach(_h_file ${_h_files})
-    set(_h_file_out_path ${CMAKE_CURRENT_BINARY_DIR}/inc/${_h_file})
-    if(NOT EXISTS ${_h_file_out_path})
-        message(STATUS "downloading ${_h_file}")
-        # notice the tag matches the nuget version
-        file(DOWNLOAD
-            https://raw.githubusercontent.com/microsoft/msquic/v2.1.7/src/inc/${_h_file}
-            ${_h_file_out_path}
-        )
-    endif()
-endforeach()
-
 # import msquic as a cmake lib
 add_library(msquic SHARED IMPORTED GLOBAL)
 
@@ -62,7 +44,6 @@ endif(WIN32)
 
 target_include_directories(msquic
   INTERFACE ${msquic_release_SOURCE_DIR}/include
-  INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/inc
 )
 
 # compile the example
@@ -132,3 +113,21 @@ target_link_libraries(msquic-asio
 
 enable_testing()
 add_subdirectory(tests)
+
+# coverage
+find_program(OpenCppCoverage_exe
+        NAMES OpenCppCoverage.exe
+)
+if(OpenCppCoverage_exe)
+    message(STATUS "coverage tool found: ${OpenCppCoverage_exe}")
+    # coverage tool only recognizes windows style path, backslash.
+    file(TO_NATIVE_PATH "${CMAKE_CURRENT_SOURCE_DIR}" PWD_WIN_PATH)
+    add_custom_target(coverage
+        COMMAND ${OpenCppCoverage_exe} --quiet --export_type cobertura:cobertura.xml --cover_children 
+        --sources "${PWD_WIN_PATH}\\src" --sources "${PWD_WIN_PATH}\\include" --modules "${PWD_WIN_PATH}"
+        -- ctest -C Debug --test-dir build --repeat until-pass:3 --timeout 30
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+else()
+    message(STATUS "coverage tool not found: ${OpenCppCoverage_exe}")
+endif()
