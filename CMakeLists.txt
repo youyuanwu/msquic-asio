@@ -5,10 +5,10 @@ project(msquic-asio)
 include(cmake/clang-format.cmake)
 
 if(WIN32)
-  set(release_url "https://github.com/microsoft/msquic/releases/download/v2.1.7/msquic_windows_x64_Release_schannel.zip")
+  set(release_url "https://github.com/microsoft/msquic/releases/download/v2.2.2/msquic_windows_x64_Release_schannel.zip")
 else()
   # linux
-  set(release_url "https://github.com/microsoft/msquic/releases/download/v2.1.7/msquic_linux_x64_Release_openssl.zip")
+  set(release_url "https://github.com/microsoft/msquic/releases/download/v2.2.2/msquic_linux_x64_Release_openssl.zip")
   find_package(OpenSSL REQUIRED)
   # openssl needs version 1.1. ubuntu 20.04 has it, 22.04 is too new.
 endif(WIN32)
@@ -36,7 +36,11 @@ set_target_properties(msquic PROPERTIES
     IMPORTED_IMPLIB ${msquic_release_SOURCE_DIR}/lib/msquic.lib
 )
 else()
-set(_msquic_dll ${msquic_release_SOURCE_DIR}/bin/libmsquic.so.2.1.7)
+# glob msquic lib
+file(GLOB _msquic_dll 
+  ${msquic_release_SOURCE_DIR}/bin/libmsquic.so.*
+)
+message(STATUS "Found msquic lib: ${_msquic_dll}")
 set_target_properties(msquic PROPERTIES
     IMPORTED_LOCATION ${_msquic_dll}
 )
@@ -111,9 +115,11 @@ target_link_libraries(msquic-asio
     INTERFACE msquic
 )
 
-enable_testing()
-add_subdirectory(tests)
-
+# only support win32 tests
+if(WIN32)
+  enable_testing()
+  add_subdirectory(tests)
+endif(WIN32)
 # coverage
 find_program(OpenCppCoverage_exe
         NAMES OpenCppCoverage.exe

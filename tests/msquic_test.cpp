@@ -1,7 +1,3 @@
-#ifndef TEST_CERT_HASH
-#error "test cert not found"
-#endif
-
 #define BOOST_TEST_MODULE msquic_test
 #include <boost/test/unit_test.hpp>
 
@@ -15,11 +11,10 @@
 #include "boost/msquic/msquic_api.hpp"
 
 #include "boost/msquic/event.hpp"
+#include "test_helper.hpp"
+
 #include <future>
 #include <latch>
-
-#define QUOTE(x) #x
-#define STR(x) QUOTE(x)
 
 namespace net = boost::asio;
 namespace quic = boost::msquic;
@@ -81,47 +76,14 @@ BOOST_AUTO_TEST_CASE(Basic) {
 void run_client_helper(
     quic::api &api,
     quic::basic_registration_handle<net::io_context::executor_type> &reg) {
-  net::io_context ioc;
-  // quic::api api;
-  // quic::basic_registration_handle reg(ioc.get_executor(), api.get());
 
   boost::system::error_code ec = {};
-  const QUIC_REGISTRATION_CONFIG RegConfig = {
-      "quicsample", QUIC_EXECUTION_PROFILE_LOW_LATENCY};
-  reg.open(RegConfig, ec);
-  BOOST_REQUIRE(!ec.failed());
-  BOOST_REQUIRE(reg.is_open());
-
-  quic::basic_config_handle config(ioc.get_executor(), api.get());
-  const QUIC_BUFFER Alpn = {sizeof("sample") - 1, (uint8_t *)"sample"};
 
   net::io_context cioc;
   // reuse server registration.
 
-  // open client config
-  QUIC_SETTINGS Settings = {0};
-  //
-  // Configures the client's idle timeout.
-  //
-  Settings.IdleTimeoutMs = 1000;
-  Settings.IsSet.IdleTimeoutMs = TRUE;
-
-  //
-  // Configures a default client configuration, optionally disabling
-  // server certificate validation.
-  //
-  QUIC_CREDENTIAL_CONFIG CredConfig = {};
-  CredConfig.Type = QUIC_CREDENTIAL_TYPE_NONE;
-  CredConfig.Flags = QUIC_CREDENTIAL_FLAG_CLIENT;
-  // use insecure
-  CredConfig.Flags |= QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
-
   quic::basic_config_handle client_config(cioc.get_executor(), api.get());
-  client_config.open(reg.native_handle(), Settings, Alpn, ec);
-  BOOST_REQUIRE(!ec.failed());
-  // fix me:
-  client_config.load_cred2(CredConfig, ec);
-  BOOST_REQUIRE(!ec.failed());
+  config_test_client_handle(client_config, reg.native_handle());
 
   quic::basic_connection_handle<net::io_context::executor_type> conn(
       cioc.get_executor(), api.get());
@@ -158,17 +120,24 @@ void run_client_helper(
       // recieve from server.
       BOOST_TEST_MESSAGE("client async_receive");
       std::string buff(123, 'a');
-      std::size_t rlen = co_await stream.async_recieve(buff.data(), buff.size(),
+      std::size_t rlen = co_await stream.async_receive(buff.data(), buff.size(),
                                                        net::use_awaitable);
       std::string expected_resp = "mydata";
       BOOST_REQUIRE_EQUAL(rlen, expected_resp.size());
       BOOST_REQUIRE_EQUAL(expected_resp, buff.substr(0, 6));
 
-      // std::this_thread::sleep_for(std::chrono::seconds(2));
-      // stream.shutdown(QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE, 0, cec);
-      // BOOST_REQUIRE_MESSAGE(!cec.failed(), cec.message());
       BOOST_TEST_MESSAGE("client async_wait_peer_shutdown");
       co_await stream.async_wait_peer_shutdown(net::use_awaitable);
+
+      // we wait twice, the event should go though successfully immediately.
+      BOOST_TEST_MESSAGE("client async_wait_peer_shutdown2");
+      co_await stream.async_wait_peer_shutdown(net::use_awaitable);
+
+      // after peer shutdown, try read. It should success and complete with 0
+      // len
+      std::size_t rlen2 = co_await stream.async_receive(
+          buff.data(), buff.size(), net::use_awaitable);
+      BOOST_REQUIRE_EQUAL(rlen2, 0);
 
       BOOST_TEST_MESSAGE("client async_wait_shutdown_complete");
       co_await stream.async_wait_shutdown_complete(net::use_awaitable);
@@ -203,58 +172,12 @@ BOOST_AUTO_TEST_CASE(Handle) {
   quic::api api;
 
   quic::basic_registration_handle reg(ioc.get_executor(), api.get());
+  set_registration_handle(reg);
 
   boost::system::error_code ec = {};
-  const QUIC_REGISTRATION_CONFIG RegConfig = {
-      "quicsample", QUIC_EXECUTION_PROFILE_LOW_LATENCY};
-  reg.open(RegConfig, ec);
-  BOOST_REQUIRE(!ec.failed());
-  BOOST_REQUIRE(reg.is_open());
 
   quic::basic_config_handle config(ioc.get_executor(), api.get());
-  const QUIC_BUFFER Alpn = {sizeof("sample") - 1, (uint8_t *)"sample"};
-  {
-    // config
-    QUIC_SETTINGS Settings = {0};
-    //
-    // Configures the server's idle timeout.
-    //
-    Settings.IdleTimeoutMs = 1000;
-    Settings.IsSet.IdleTimeoutMs = TRUE;
-    //
-    // Configures the server's resumption level to allow for resumption and
-    // 0-RTT.
-    //
-    Settings.ServerResumptionLevel = QUIC_SERVER_RESUME_AND_ZERORTT;
-    Settings.IsSet.ServerResumptionLevel = TRUE;
-    //
-    // Configures the server's settings to allow for the peer to open a single
-    // bidirectional stream. By default connections are not configured to allow
-    // any streams from the peer.
-    //
-    Settings.PeerBidiStreamCount = 1;
-    Settings.IsSet.PeerBidiStreamCount = TRUE;
-
-    config.open(reg.native_handle(), Settings, Alpn, ec);
-    BOOST_REQUIRE(!ec.failed());
-    QUIC_CREDENTIAL_CONFIG Config = {};
-    QUIC_CERTIFICATE_HASH certHash = {};
-
-    // hard code for now
-    const char *Cert = STR(TEST_CERT_HASH);
-    std::string hash = boost::algorithm::unhex(std::string(Cert));
-    assert(hash.size() == sizeof(certHash.ShaHash));
-    //
-    // Load the server's certificate from the default certificate store,
-    // using the provided certificate hash.
-    //
-    Config.Type = QUIC_CREDENTIAL_TYPE_CERTIFICATE_HASH;
-    std::copy(hash.begin(), hash.end(), certHash.ShaHash);
-    Config.CertificateHash = &certHash;
-
-    config.load_cred2(Config, ec);
-    BOOST_REQUIRE(!ec.failed());
-  }
+  config_test_server_handle(config, reg.native_handle());
 
   quic::basic_listener_handle listener(ioc.get_executor(), api.get(), config);
   listener.open(reg.native_handle(), ec);
@@ -286,7 +209,7 @@ BOOST_AUTO_TEST_CASE(Handle) {
               // TODO: wait for receive
               BOOST_TEST_MESSAGE("async_receive stream");
               std::string buff(123, 'a');
-              std::size_t rlen = co_await stream.async_recieve(
+              std::size_t rlen = co_await stream.async_receive(
                   buff.data(), buff.size(), net::use_awaitable);
 
               // peer finishes request and close its direction
@@ -346,7 +269,7 @@ BOOST_AUTO_TEST_CASE(Handle) {
   QuicAddrSetFamily(&addr, QUIC_ADDRESS_FAMILY_UNSPEC);
   QuicAddrSetPort(&addr, 4567);
 
-  listener.start(Alpn, addr, ec);
+  listener.start(get_test_alpn(), addr, ec);
   BOOST_REQUIRE(!ec.failed());
 
   // run server in a separate thread
@@ -376,6 +299,7 @@ BOOST_AUTO_TEST_CASE(Client) {
   net::io_context ioc;
   quic::api api;
   quic::basic_registration_handle reg(ioc.get_executor(), api.get());
+  set_registration_handle(reg);
   // run_client_helper(api, reg);
 }
 

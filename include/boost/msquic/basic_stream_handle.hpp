@@ -131,19 +131,21 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
       temp.Length = buf->Length;
       cpContext->buf_vec_.push_back(std::move(temp));
     }
-    // cpContext->BufferCount_ = Event->RECEIVE.BufferCount;
-    // cpContext->Buffers_ = Event->RECEIVE.Buffers;
     cpContext->set_stream_event(ec);
     // return pending so that msquic will retail buffers, and we handle it in
     // asio.
     // The buffer array is not retained by msquic, so we copied to vector above.
-    // TODO: maybe buf->Buffer pointer is not freed but the buf is freed.
     Status = QUIC_STATUS_PENDING;
     break;
-  case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
+  case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN: {
     cpContext->bs_.acquire();
     BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN");
-    if (cpContext->get_state() != state_type::peer_shutdown) {
+    auto state = cpContext->get_state();
+    if (state == state_type::receive) {
+      // we want to receive more but peer eof.
+      // simply trigger the completion and it will complete with 0 length
+      cpContext->set_state(state_type::peer_shutdown);
+    } else if (state != state_type::peer_shutdown) {
       // state not match
       cpContext->set_state(state_type::error);
       ec.assign(net::error::basic_errors::fault,
@@ -152,10 +154,7 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
     }
     cpContext->set_stream_event(ec);
     //  The peer gracefully shut down its send direction of the stream.
-    //
-    //  printf("[strm][%p] Peer shut down\n", Stream);
-    //  ServerSend(Stream);
-    break;
+  } break;
   case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
     cpContext->bs_.acquire();
     BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_PEER_SEND_ABORTED");
@@ -282,6 +281,7 @@ public:
             self.complete(h->get_ctx()->ec_, 0);
             return;
           }
+
           std::vector<QUIC_BUFFER> &buffs = h->get_ctx()->buf_vec_;
           // copy buffers into out buffer. make a temp variable to advance
           // during copy
@@ -443,16 +443,25 @@ public:
   }
 
   template <typename Token>
-  auto async_recieve(_Out_ LPVOID lpBuffer, _In_ std::size_t bufferLen,
+  auto async_receive(_Out_ LPVOID lpBuffer, _In_ std::size_t bufferLen,
                      Token &&token) {
-    this->ctx_->set_state(state_type::receive);
     this->ctx_->reset_stream_event();
+    bool peer_shutdown = ctx_->get_state() == state_type::peer_shutdown;
+    if (peer_shutdown) {
+      // peer direction is eof, so any read will be success with 0 length.
+      ctx_->set_len(0); // this does not matter.
+      ctx_->set_stream_event({});
+    } else {
+      this->ctx_->set_state(state_type::receive);
+    }
     auto temp =
         boost::asio::async_compose<Token, void(boost::system::error_code,
                                                std::size_t)>(
             details::async_receive_op<executor_type>(this, lpBuffer, bufferLen),
             token, this->get_executor());
-    ctx_->bs_.release();
+    if (!peer_shutdown) {
+      ctx_->bs_.release();
+    }
     return std::move(temp);
   }
 
@@ -463,16 +472,25 @@ public:
   BOOST_ASIO_INITFN_AUTO_RESULT_TYPE(Token, void(boost::system::error_code))
   async_wait_peer_shutdown(BOOST_ASIO_MOVE_ARG(
       Token) token BOOST_ASIO_DEFAULT_COMPLETION_TOKEN(executor_type)) {
-    // wait for peer shutdown to happen in callback
-    ctx_->set_state(state_type::peer_shutdown);
     ctx_->reset_stream_event();
+    bool already_shutdown = ctx_->get_state() == state_type::peer_shutdown;
+    if (already_shutdown) {
+      // just set the event and callaback will be triggered immediately.
+      ctx_->set_len(0);
+      ctx_->set_stream_event({});
+    } else {
+      // wait for peer shutdown to happen in callback
+      ctx_->set_state(state_type::peer_shutdown);
+    }
 
     auto temp =
         boost::asio::async_compose<Token, void(boost::system::error_code)>(
             details::async_wait_op<executor_type>(&this->ctx_->ev_,
                                                   &this->ctx_->ec_),
             token, this->get_executor());
-    ctx_->bs_.release();
+    if (!already_shutdown) {
+      ctx_->bs_.release();
+    }
     return std::move(temp);
   }
 

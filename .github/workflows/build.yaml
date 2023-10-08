@@ -8,7 +8,7 @@ jobs:
     strategy:
       matrix:
         BUILD_TYPE: ["Debug", "Release"]
-        os: [ windows-latest ] # ubuntu-20.04 is disabled until dependency is easier
+        os: [ windows-latest, ubuntu-latest ]
         BOOST_VERSION: [ 1.79.0 ]
     steps:
     - uses: actions/checkout@v2
@@ -33,7 +33,7 @@ jobs:
         link: static
 
     - name: Get Boost ubuntu
-      if: ${{ matrix.os == 'ubuntu-20.04' }}
+      if: ${{ matrix.os == 'ubuntu-latest' }}
       uses: MarkusJx/install-boost@v2.4.1
       id: install-boost1
       with:
@@ -42,11 +42,11 @@ jobs:
         # https://github.com/MarkusJx/prebuilt-boost/blob/main/versions-manifest.json
         boost_version: ${{ matrix.BOOST_VERSION }}
         toolset: gcc
-        platform_version: 20.04
+        platform_version: 22.04
         link: static
     
     - name: Get OpenCppCoverage
-      if: ${{ matrix.BUILD_TYPE == 'Debug' }}
+      if: ${{ matrix.BUILD_TYPE == 'Debug' && matrix.os == 'windows-latest' }}
       env:
         myUrl: "https://github.com/OpenCppCoverage/OpenCppCoverage/releases/download/release-0.9.9.0/OpenCppCoverageSetup-x64-0.9.9.0.exe"
       run: |
@@ -67,12 +67,12 @@ jobs:
       run: ctest -C ${{ matrix.BUILD_TYPE }} --test-dir build --verbose --repeat until-pass:3 --timeout 30
 
     - name: run test with coverage
-      if: ${{ matrix.BUILD_TYPE == 'Debug' }}
+      if: ${{ matrix.BUILD_TYPE == 'Debug' && matrix.os == 'windows-latest' }}
       run: >
         cmake --build build --config ${{ matrix.BUILD_TYPE }} --target coverage
     
     - name: Upload Report to Codecov
-      if: ${{ matrix.BUILD_TYPE == 'Debug' }}
+      if: ${{ matrix.BUILD_TYPE == 'Debug' && matrix.os == 'windows-latest' }}
       uses: codecov/codecov-action@v2
       with:
         files: ./cobertura.xml
