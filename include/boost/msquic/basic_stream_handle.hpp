@@ -1,9 +1,12 @@
 #include "boost/msquic/basic_quic_handle.hpp"
 #include "boost/msquic/event.hpp"
 
+#include <oneshot.hpp>
+
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string_view>
 
 namespace boost {
 namespace msquic {
@@ -60,12 +63,15 @@ public:
 
   // recieved buffers.
   // TODO: make without alloc
-  std::vector<QUIC_BUFFER> buf_vec_;
+  std::vector<std::u8string_view> buf_vec_;
 
   // allow only 1 callback at a time
   std::mutex mtx_;
   // allow 1 task at a time;
   std::binary_semaphore bs_;
+
+  oneshot::sender<boost::system::error_code> start_complete_tx_;
+  oneshot::receiver<boost::system::error_code> start_complete_rx_;
 
 private:
   state state_;
@@ -92,13 +98,15 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
   QUIC_STATUS Status = QUIC_STATUS_SUCCESS;
   switch (Event->Type) {
   case QUIC_STREAM_EVENT_START_COMPLETE:
-    cpContext->bs_.acquire();
     BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_START_COMPLETE");
     // printf("[strm][%p] Start complete\n", Stream);
     //  TODO: this event is not delivered in success case.???
     // cpContext->start_bs_.acquire();
+    // TODO: assert not needed.
     assert(cpContext->get_state() == state_type::start);
-    cpContext->set_stream_event(ec);
+    ec.assign(Event->START_COMPLETE.Status,
+              boost::asio::error::get_system_category());
+    cpContext->start_complete_tx_.send(ec);
     break;
   case QUIC_STREAM_EVENT_SEND_COMPLETE:
     cpContext->bs_.acquire();
@@ -126,13 +134,12 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
       const QUIC_BUFFER *buf = Event->RECEIVE.Buffers + i;
       // printf("[%p] %.*s\n",buf->Buffer, buf->Length, buf->Buffer);
       // add to buf vec
-      QUIC_BUFFER temp = {};
-      temp.Buffer = buf->Buffer;
-      temp.Length = buf->Length;
+      std::u8string_view temp(reinterpret_cast<char8_t const *>(buf->Buffer),
+                              buf->Length);
       cpContext->buf_vec_.push_back(std::move(temp));
     }
     cpContext->set_stream_event(ec);
-    // return pending so that msquic will retail buffers, and we handle it in
+    // return pending so that msquic will retain buffers, and we handle it in
     // asio.
     // The buffer array is not retained by msquic, so we copied to vector above.
     Status = QUIC_STATUS_PENDING;
@@ -282,21 +289,19 @@ public:
             return;
           }
 
-          std::vector<QUIC_BUFFER> &buffs = h->get_ctx()->buf_vec_;
+          std::vector<std::u8string_view> &buffs = h->get_ctx()->buf_vec_;
           // copy buffers into out buffer. make a temp variable to advance
           // during copy
           LPVOID outbuff = outbuffptr;
           std::size_t remaining = outbuff_size; // remaining size of outbuff
           std::size_t copied = 0;               // bytes copied already
-          for (std::size_t i = 0; i < buffs.size(); i++) {
-            const QUIC_BUFFER &b = buffs[i];
+          for (auto &buff : buffs) {
             // printf("Copy buffer [%p] %d\n", b.Buffer, b.Length);
-            std::size_t to_copy =
-                std::min(remaining, static_cast<std::size_t>(b.Length));
+            std::size_t to_copy = std::min(remaining, buff.size());
             if (to_copy == 0) {
               continue;
             }
-            errno_t ec_cp = memcpy_s(outbuff, remaining, b.Buffer, to_copy);
+            errno_t ec_cp = memcpy_s(outbuff, remaining, buff.data(), to_copy);
             assert(ec_cp == 0);
             DBG_UNREFERENCED_LOCAL_VARIABLE(ec_cp);
             remaining -= to_copy;
@@ -376,23 +381,35 @@ public:
                   token BOOST_ASIO_DEFAULT_COMPLETION_TOKEN(executor_type)) {
     boost::system::error_code ec = {};
 
+    // the state is only for debugging purpose
     ctx_->set_state(state_type::start);
-    ctx_->reset_stream_event();
+    // make sender and receiver and store in the ctx
+    auto [tx, rx] = oneshot::create<boost::system::error_code>();
+    ctx_->start_complete_tx_ = std::move(tx);
+    ctx_->start_complete_rx_ = std::move(rx);
 
     QUIC_STATUS Status = this->api_->StreamStart(this->h_, Flags);
     if (QUIC_FAILED(Status)) {
       // todo : make the right ec
       ec.assign(net::error::basic_errors::network_down,
                 boost::asio::error::get_system_category());
-      ctx_->set_stream_event(ec);
+      ctx_->start_complete_tx_.send(ec);
     }
-    auto temp =
-        boost::asio::async_compose<Token, void(boost::system::error_code)>(
-            details::async_wait_op<executor_type>(&this->ctx_->ev_,
-                                                  &this->ctx_->ec_),
-            token, this->get_executor());
-    ctx_->bs_.release();
-    return std::move(temp);
+    return net::async_initiate<decltype(token),
+                               void(boost::system::error_code)>(
+        [this](auto handler) {
+          ctx_->start_complete_rx_.async_wait(
+              [h = std::move(handler),
+               this](boost::system::error_code ec) mutable {
+                // if oneshot has error retain it, else use msquic callback
+                // error sent from backend
+                if (!ec.failed()) {
+                  ec = ctx_->start_complete_rx_.get();
+                }
+                std::move(h)(ec);
+              });
+        },
+        std::move(token));
   }
 
   template <BOOST_ASIO_COMPLETION_TOKEN_FOR(void(boost::system::error_code,
@@ -488,6 +505,7 @@ public:
             details::async_wait_op<executor_type>(&this->ctx_->ev_,
                                                   &this->ctx_->ec_),
             token, this->get_executor());
+
     if (!already_shutdown) {
       ctx_->bs_.release();
     }

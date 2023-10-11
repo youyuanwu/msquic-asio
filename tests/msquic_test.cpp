@@ -2,6 +2,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <boost/asio.hpp>
+#include <oneshot.hpp>
 
 #include "boost/msquic/basic_listener_handle.hpp"
 
@@ -70,6 +71,30 @@ BOOST_AUTO_TEST_CASE(Basic) {
   ioc.run();
   b.wait();
   BOOST_REQUIRE_EQUAL(11, i);
+}
+
+BOOST_AUTO_TEST_CASE(Oneshot) {
+
+  auto ctx = net::io_context{};
+
+  auto [s, r] = oneshot::create<std::string>();
+
+  net::co_spawn(
+      ctx,
+      [ss = std::move(s)]() mutable -> net::awaitable<void> {
+        ss.send("hello");
+        co_return;
+      },
+      net::detached);
+  net::co_spawn(
+      ctx,
+      [rr = std::move(r)]() mutable -> net::awaitable<void> {
+        co_await rr.async_wait(net::deferred);
+        BOOST_REQUIRE_EQUAL(rr.get(), "hello");
+      },
+      net::detached);
+
+  ctx.run();
 }
 
 // runs the client synchronously

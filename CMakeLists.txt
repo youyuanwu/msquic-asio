@@ -83,10 +83,29 @@ endif()
 # linux:
 # LD_LIBRARY_PATH=./build/_deps/msquic_release-src/bin ./build/quicsample
 
-# msquic-asio lib
 set(Boost_USE_STATIC_LIBS ON) # use static boost
+set(Boost_NO_WARN_NEW_VERSIONS ON)
 find_package(Boost REQUIRED)
 
+# third party oneshot asio lib
+message(STATUS "fetching ashtum_oneshot")
+include(FetchContent)
+FetchContent_Declare(ashtum_oneshot
+    GIT_REPOSITORY https://github.com/youyuanwu/oneshot
+    GIT_TAG 7516175b7f624b2ae137d0bca972d57c1f65814b
+)
+FetchContent_GetProperties(ashtum_oneshot)
+if(NOT ashtum_oneshot_POPULATED)
+  FetchContent_Populate(ashtum_oneshot)
+  # do not add to tree
+endif()
+
+# import oneshot lib
+add_library(asio_oneshot INTERFACE)
+target_include_directories(asio_oneshot INTERFACE ${ashtum_oneshot_SOURCE_DIR}/include)
+
+
+# msquic-asio lib
 file(GLOB_RECURSE MSQUIC_ASIO_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp)
 
 if(WIN32)
@@ -99,6 +118,7 @@ else()
   #linux does not like sources for interface lib
   add_library(msquic-asio INTERFACE)
 endif()
+set_property(TARGET msquic-asio PROPERTY CXX_STANDARD 20)
 
 target_include_directories(msquic-asio INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -111,7 +131,7 @@ target_compile_definitions(msquic-asio
 
 # currently winasio uses boost log for logging
 target_link_libraries(msquic-asio
-    INTERFACE Boost::disable_autolinking Boost::headers
+    INTERFACE Boost::disable_autolinking Boost::headers asio_oneshot
     INTERFACE msquic
 )
 

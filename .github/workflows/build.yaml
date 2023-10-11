@@ -9,7 +9,7 @@ jobs:
       matrix:
         BUILD_TYPE: ["Debug", "Release"]
         os: [ windows-latest, ubuntu-latest ]
-        BOOST_VERSION: [ 1.79.0 ]
+        BOOST_VERSION: [ 1.83.0 ]
     steps:
     - uses: actions/checkout@v2
 
