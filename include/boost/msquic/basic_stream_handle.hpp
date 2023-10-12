@@ -16,50 +16,37 @@ template <typename Executor> class basic_stream_handle;
 
 namespace details {
 
+using receive_t =
+    std::pair<boost::system::error_code, std::vector<std::u8string_view>>;
+
 template <typename Executor> class AsioServerStreamCtx {
 public:
   /// The type of the executor associated with the object.
   typedef Executor executor_type;
 
   enum class state {
-    idle,
-    start,
-    send,
-    receive,
-    peer_shutdown,
+    ok,
+    peer_shutdown, // peer direction will no longer deliver data
     peer_abort,
-    shutdown_complete,
-    done,
-    error
+    shutdown_complete
   };
 
-  AsioServerStreamCtx(const executor_type &ex)
-      : ev_(ex), ec_(), len_(0), state_(state::idle), mtx_(), bs_(0) {}
+  struct pending_actions {
+    bool start;
+    bool send;
+    // who ever arrive first needs to init the channel
+    // frontend arrive first wait for backend.
+    bool receive_frontend;
+    // backend arrive first wait for frontend.
+    bool receive_backend;
+    bool shutdown;
+  };
 
-  void set_stream_event(boost::system::error_code ec) {
-    ec_ = ec;
-    ev_.set();
-  }
-
-  void reset_stream_event() {
-    ec_.clear();
-    ev_.reset();
-  }
-
-  void set_len(std::size_t len) { len_ = len; }
+  AsioServerStreamCtx() : state_(state::ok), mtx_(), pending_() {}
 
   void set_state(state s) { state_ = s; }
 
   state get_state() { return state_; }
-
-  event<executor_type> ev_;
-
-  // error code saved from callback
-  boost::system::error_code ec_;
-
-  // len saved from callback.
-  // or send total len.
-  std::size_t len_;
 
   // recieved buffers.
   // TODO: make without alloc
@@ -68,10 +55,21 @@ public:
   // allow only 1 callback at a time
   std::mutex mtx_;
   // allow 1 task at a time;
-  std::binary_semaphore bs_;
+  // std::binary_semaphore bs_;
+
+  pending_actions pending_;
 
   oneshot::sender<boost::system::error_code> start_complete_tx_;
   oneshot::receiver<boost::system::error_code> start_complete_rx_;
+
+  oneshot::sender<boost::system::error_code> send_tx_;
+  oneshot::receiver<boost::system::error_code> send_rx_;
+
+  oneshot::sender<receive_t> receive_tx_;
+  oneshot::receiver<receive_t> receive_rx_;
+
+  oneshot::sender<boost::system::error_code> shutdown_tx_;
+  oneshot::receiver<boost::system::error_code> shutdown_rx_;
 
 private:
   state state_;
@@ -81,7 +79,7 @@ template <typename Executor>
 _IRQL_requires_max_(DISPATCH_LEVEL)
     _Function_class_(QUIC_STREAM_CALLBACK) QUIC_STATUS QUIC_API
     AsioServerStreamCallback(_In_ HQUIC Stream, _In_opt_ void *Context,
-                             _Inout_ QUIC_STREAM_EVENT *Event) {
+                             _Inout_ QUIC_STREAM_EVENT *Event) noexcept {
   UNREFERENCED_PARAMETER(Stream);
 
   typedef Executor executor_type;
@@ -92,147 +90,127 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
   details::AsioServerStreamCtx<executor_type> *cpContext =
       (details::AsioServerStreamCtx<executor_type> *)Context;
 
-  // allow 1 callback at a time
+  // allow 1 callback at a time, and synchronize with frontend calls.
   std::scoped_lock lock(cpContext->mtx_);
 
   QUIC_STATUS Status = QUIC_STATUS_SUCCESS;
   switch (Event->Type) {
   case QUIC_STREAM_EVENT_START_COMPLETE:
     BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_START_COMPLETE");
-    // printf("[strm][%p] Start complete\n", Stream);
-    //  TODO: this event is not delivered in success case.???
-    // cpContext->start_bs_.acquire();
-    // TODO: assert not needed.
-    assert(cpContext->get_state() == state_type::start);
+    assert(cpContext->pending_.start);
     ec.assign(Event->START_COMPLETE.Status,
               boost::asio::error::get_system_category());
+    cpContext->pending_.start = false;
     cpContext->start_complete_tx_.send(ec);
     break;
   case QUIC_STREAM_EVENT_SEND_COMPLETE:
-    cpContext->bs_.acquire();
     BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_SEND_COMPLETE");
-    if (cpContext->get_state() != state_type::send) {
-      // stream is in wrong state
-      // this is is a bug in this lib
-      ec.assign(net::error::basic_errors::fault,
-                boost::asio::error::get_system_category());
-    }
-    // printf("[strm][%p] Data sent\n", Stream);
-    cpContext->set_stream_event(ec);
+    assert(cpContext->pending_.send);
+    cpContext->pending_.send = false;
+    cpContext->send_tx_.send(ec);
     break;
-  case QUIC_STREAM_EVENT_RECEIVE:
-    cpContext->bs_.acquire();
+  case QUIC_STREAM_EVENT_RECEIVE: {
     BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_RECEIVE: len " +
                        std::to_string(Event->RECEIVE.TotalBufferLength));
-    assert(cpContext->get_state() == state_type::receive);
     //
     // Data was received from the peer on the stream.
     //
+
+    // init channels if arrived first
+    assert(!cpContext->pending_.receive_backend);
+    if (cpContext->pending_.receive_frontend) {
+      cpContext->pending_.receive_frontend = false;
+    } else {
+      // backend arrive first
+      cpContext->pending_.receive_backend = true;
+      auto [tx, rx] =
+          oneshot::create<std::pair<boost::system::error_code,
+                                    std::vector<std::u8string_view>>>();
+      cpContext->receive_tx_ = std::move(tx);
+      cpContext->receive_rx_ = std::move(rx);
+    }
+
     // Buffer pointers are valid until we call resume.
-    // printf("[strm][%p] Data received\n", Stream);
+    std::vector<std::u8string_view> buffs;
     for (size_t i = 0; i < Event->RECEIVE.BufferCount; i++) {
       const QUIC_BUFFER *buf = Event->RECEIVE.Buffers + i;
       // printf("[%p] %.*s\n",buf->Buffer, buf->Length, buf->Buffer);
       // add to buf vec
       std::u8string_view temp(reinterpret_cast<char8_t const *>(buf->Buffer),
                               buf->Length);
-      cpContext->buf_vec_.push_back(std::move(temp));
+      buffs.push_back(std::move(temp));
     }
-    cpContext->set_stream_event(ec);
+    cpContext->receive_tx_.send(std::make_pair(ec, std::move(buffs)));
+    // cpContext->set_stream_event(ec);
     // return pending so that msquic will retain buffers, and we handle it in
     // asio.
     // The buffer array is not retained by msquic, so we copied to vector above.
     Status = QUIC_STATUS_PENDING;
-    break;
+  } break;
   case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN: {
-    cpContext->bs_.acquire();
     BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN");
-    auto state = cpContext->get_state();
-    if (state == state_type::receive) {
-      // we want to receive more but peer eof.
-      // simply trigger the completion and it will complete with 0 length
-      cpContext->set_state(state_type::peer_shutdown);
-    } else if (state != state_type::peer_shutdown) {
-      // state not match
-      cpContext->set_state(state_type::error);
-      ec.assign(net::error::basic_errors::fault,
-                boost::asio::error::get_system_category());
-      cpContext->set_stream_event(ec);
+    cpContext->set_state(state_type::peer_shutdown);
+    // start and read case has complete event notification
+    // only handle receive here.
+    if (cpContext->pending_.receive_frontend) {
+      // frontend is waiting. This means no more data to receive.
+      // send 0 len and success
+      cpContext->pending_.receive_frontend = false;
+      cpContext->receive_tx_.send(
+          std::make_pair(ec, std::vector<std::u8string_view>{}));
     }
-    cpContext->set_stream_event(ec);
+    if (cpContext->pending_.send || cpContext->pending_.receive_backend) {
+      // this direction send to peer might continue.
+      // backend queued receive can proceed.
+    }
     //  The peer gracefully shut down its send direction of the stream.
   } break;
   case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
-    cpContext->bs_.acquire();
     BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_PEER_SEND_ABORTED");
-    if (cpContext->get_state() == state_type::peer_abort) {
-      cpContext->set_stream_event(ec);
-    } else {
-      // state not match
-      cpContext->set_state(state_type::error);
-      ec.assign(net::error::basic_errors::fault,
-                boost::asio::error::get_system_category());
-      cpContext->set_stream_event(ec);
+    cpContext->set_state(state_type::peer_abort);
+    // start and read case has complete event notification
+    // only handle receive here.
+    if (cpContext->pending_.receive_frontend) {
+      // frontend is waiting. This means no more data to receive.
+      // send 0 len and error
+      ec.assign(net::error::basic_errors::connection_aborted,
+                net::error::get_system_category());
+      cpContext->pending_.receive_frontend = false;
+      cpContext->receive_tx_.send(
+          std::make_pair(ec, std::vector<std::u8string_view>{}));
     }
-    // The peer aborted its send direction of the stream.
-    //
-    // printf("[strm][%p] Peer aborted\n", Stream);
-    // MsQuic->StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+    // this direction for send should have been shutdown? TODO.
+    assert(!cpContext->pending_.send);
     break;
   case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
-    cpContext->bs_.acquire();
     BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE");
-    if (cpContext->get_state() == state_type::shutdown_complete) {
-      cpContext->set_state(state_type::done);
-      cpContext->set_stream_event(ec);
-    } else {
-      // state not match
-      cpContext->set_state(state_type::error);
-      ec.assign(net::error::basic_errors::fault,
-                boost::asio::error::get_system_category());
-      cpContext->set_stream_event(ec);
-    }
     //
     // Both directions of the stream have been shut down and MsQuic is done
     // with the stream. It can now be safely cleaned up.
     //
-    // printf("[strm][%p] All done\n", Stream);
-    // MsQuic->StreamClose(Stream);
+    if (cpContext->pending_.receive_frontend) {
+      // frontend is waiting. This means no more data to receive.
+      // send 0 len and error. TODO: figureout ec
+      ec.assign(net::error::basic_errors::broken_pipe,
+                net::error::get_system_category());
+      cpContext->pending_.receive_frontend = false;
+      cpContext->receive_tx_.send(
+          std::make_pair(ec, std::vector<std::u8string_view>{}));
+    }
+    if (cpContext->pending_.shutdown) {
+      // front end must have inited the channel
+      ec.clear();
+      cpContext->shutdown_tx_.send(ec);
+    }
+    assert(!cpContext->pending_.send);
+    assert(!cpContext->pending_.receive_frontend);
+    assert(!cpContext->pending_.receive_backend);
     break;
   default:
     break;
   }
   return Status;
 }
-
-// handler signature void(ec, size_t)
-template <typename Executor> class async_len_op : boost::asio::coroutine {
-public:
-  async_len_op(event<Executor> *ev, boost::system::error_code *ctx_ec,
-               std::size_t *len)
-      : ev_(ev), ctx_ec_(ctx_ec), len_(len) {}
-
-  template <typename Self>
-  void operator()(Self &self, boost::system::error_code ec = {}) {
-    if (ec) {
-      self.complete(ec, 0);
-      return;
-    }
-    ev_->async_wait([self = std::move(self), c = ctx_ec_,
-                     l = len_](boost::system::error_code ec) mutable {
-      assert(!ec.failed());
-      DBG_UNREFERENCED_LOCAL_VARIABLE(ec);
-      // pass the ctx_ec error from callback
-      self.complete(*c, *l);
-    });
-  }
-
-private:
-  event<Executor> *ev_;
-  // ec shared and set in the callback
-  boost::system::error_code *ctx_ec_;
-  std::size_t *len_;
-};
 
 // handler signature void(ec)
 // async wait an action.
@@ -262,70 +240,6 @@ private:
   boost::system::error_code *ctx_ec_;
 };
 
-// handler signature void(ec, size_t)
-// async wait an action.
-template <typename Executor> class async_receive_op : boost::asio::coroutine {
-public:
-  async_receive_op(basic_stream_handle<Executor> *h,
-                   // params from front end
-                   LPVOID outbuff, std::size_t outbuff_size)
-      : h_(h), outbuff_(outbuff), outbuff_size_(outbuff_size) {}
-
-  template <typename Self>
-  void operator()(Self &self, boost::system::error_code ec = {}) {
-    if (ec) {
-      self.complete(ec, 0);
-      return;
-    }
-    h_->get_ctx()->ev_.async_wait(
-        [self = std::move(self), h = h_, outbuffptr = outbuff_,
-         outbuff_size = outbuff_size_](boost::system::error_code ec) mutable {
-          assert(!ec.failed());
-          assert(outbuffptr != nullptr);
-          DBG_UNREFERENCED_LOCAL_VARIABLE(ec);
-          // if has error in ctx, abort
-          if (h->get_ctx()->ec_) {
-            self.complete(h->get_ctx()->ec_, 0);
-            return;
-          }
-
-          std::vector<std::u8string_view> &buffs = h->get_ctx()->buf_vec_;
-          // copy buffers into out buffer. make a temp variable to advance
-          // during copy
-          LPVOID outbuff = outbuffptr;
-          std::size_t remaining = outbuff_size; // remaining size of outbuff
-          std::size_t copied = 0;               // bytes copied already
-          for (auto &buff : buffs) {
-            // printf("Copy buffer [%p] %d\n", b.Buffer, b.Length);
-            std::size_t to_copy = std::min(remaining, buff.size());
-            if (to_copy == 0) {
-              continue;
-            }
-            errno_t ec_cp = memcpy_s(outbuff, remaining, buff.data(), to_copy);
-            assert(ec_cp == 0);
-            DBG_UNREFERENCED_LOCAL_VARIABLE(ec_cp);
-            remaining -= to_copy;
-            copied += to_copy;
-          }
-          // clear buffs
-          buffs.clear();
-          assert(copied <= outbuff_size);
-          // copy completes, send signal to msquic
-          BOOST_TEST_MESSAGE("stream callback copied buffer: len: " +
-                             std::to_string(copied));
-          h->receive_complete(copied);
-          self.complete(h->get_ctx()->ec_, copied);
-        });
-  }
-
-private:
-  // access ctx and methods
-  basic_stream_handle<Executor> *h_;
-  // out parameters
-  LPVOID outbuff_;
-  std::size_t outbuff_size_;
-};
-
 } // namespace details
 
 template <typename Executor = net::any_io_executor>
@@ -339,9 +253,7 @@ public:
 
   basic_stream_handle(const executor_type &ex, const QUIC_API_TABLE *api)
       : basic_quic_handle<executor_type>(ex, api),
-        ctx_(
-            std::make_unique<details::AsioServerStreamCtx<executor_type>>(ex)) {
-  }
+        ctx_(std::make_unique<details::AsioServerStreamCtx<executor_type>>()) {}
 
   ~basic_stream_handle() { this->close(); }
 
@@ -381,18 +293,19 @@ public:
                   token BOOST_ASIO_DEFAULT_COMPLETION_TOKEN(executor_type)) {
     boost::system::error_code ec = {};
 
-    // the state is only for debugging purpose
-    ctx_->set_state(state_type::start);
-    // make sender and receiver and store in the ctx
+    // backend callback is guaranteed to have valid tx.
+    // start is intended to be called once only during stream's lifetime
     auto [tx, rx] = oneshot::create<boost::system::error_code>();
     ctx_->start_complete_tx_ = std::move(tx);
     ctx_->start_complete_rx_ = std::move(rx);
 
+    assert(!ctx_->pending_.start);
+    ctx_->pending_.start = true;
+
     QUIC_STATUS Status = this->api_->StreamStart(this->h_, Flags);
     if (QUIC_FAILED(Status)) {
-      // todo : make the right ec
-      ec.assign(net::error::basic_errors::network_down,
-                boost::asio::error::get_system_category());
+      ec.assign(Status, boost::asio::error::get_system_category());
+      ctx_->pending_.start = false;
       ctx_->start_complete_tx_.send(ec);
     }
     return net::async_initiate<decltype(token),
@@ -406,10 +319,11 @@ public:
                 if (!ec.failed()) {
                   ec = ctx_->start_complete_rx_.get();
                 }
+                // TODO: can clean up the channels here.
                 std::move(h)(ec);
               });
         },
-        std::move(token));
+        token);
   }
 
   template <BOOST_ASIO_COMPLETION_TOKEN_FOR(void(boost::system::error_code,
@@ -423,145 +337,180 @@ public:
              _In_opt_ void *ClientSendContext,
              BOOST_ASIO_MOVE_ARG(Token)
                  token BOOST_ASIO_DEFAULT_COMPLETION_TOKEN(executor_type)) {
-    this->ctx_->set_state(state_type::send);
-    // This does not need semaphore because send complete always comes after
-    // initiate.
+
+    // channel is made per async send call.
+    // when backend callback is excecuted the tx is always available.
+    // There is no support for multiple send in parallel.
+    auto [tx, rx] = oneshot::create<boost::system::error_code>();
+    ctx_->send_tx_ = std::move(tx);
+    ctx_->send_rx_ = std::move(rx);
+
+    assert(!ctx_->pending_.send);
+    ctx_->pending_.send = true;
+
     boost::system::error_code ec = {};
     QUIC_STATUS Status = this->api_->StreamSend(this->h_, Buffers, BufferCount,
                                                 Flags, ClientSendContext);
+    std::size_t len = 0;
     if (QUIC_FAILED(Status)) {
-      // todo : make the right ec
-      ec.assign(net::error::basic_errors::network_down,
-                boost::asio::error::get_system_category());
+      ec.assign(Status, boost::asio::error::get_system_category());
       // event handler should be triggered
       // we launch the compose op but it completes immediately
-      ctx_->set_len(0);
-      ctx_->set_stream_event(ec);
+      ctx_->pending_.send = false;
+      ctx_->send_tx_.send(ec);
     } else {
-      ctx_->set_state(state_type::send);
       // count the byte len of all buffers.
       // all buffers are queued in to msquic, and considered success.
-      std::size_t len = 0;
       for (std::size_t i = 0; i < BufferCount; i++) {
         const QUIC_BUFFER *const b = Buffers + i;
         len += b->Length;
       }
-      this->ctx_->set_len(len);
-      this->ctx_->reset_stream_event();
     }
-    auto temp =
-        boost::asio::async_compose<Token, void(boost::system::error_code,
-                                               std::size_t)>(
-            details::async_len_op<executor_type>(
-                &this->ctx_->ev_, &this->ctx_->ec_, &this->ctx_->len_),
-            token, this->get_executor());
-    ctx_->bs_.release();
-    return std::move(temp);
+    return net::async_initiate<decltype(token),
+                               void(boost::system::error_code, std::size_t)>(
+        [this, len](auto handler) {
+          ctx_->send_rx_.async_wait([h = std::move(handler), this, len](
+                                        boost::system::error_code ec) mutable {
+            // if oneshot has error retain it, else use msquic callback error
+            // sent from backend
+            if (ec.failed()) {
+              std::move(h)(ec, 0);
+              return;
+            }
+            ec = ctx_->send_rx_.get();
+            std::move(h)(ec, len);
+          });
+        },
+        token);
   }
 
   template <typename Token>
   auto async_receive(_Out_ LPVOID lpBuffer, _In_ std::size_t bufferLen,
                      Token &&token) {
-    this->ctx_->reset_stream_event();
-    bool peer_shutdown = ctx_->get_state() == state_type::peer_shutdown;
-    if (peer_shutdown) {
-      // peer direction is eof, so any read will be success with 0 length.
-      ctx_->set_len(0); // this does not matter.
-      ctx_->set_stream_event({});
+    // since receive event can arrive without frontend action, it needs to be
+    // synchronized.
+    std::scoped_lock lock(ctx_->mtx_);
+
+    // frontend flag should be unset in empty state.
+    assert(!ctx_->pending_.receive_frontend);
+    if (ctx_->pending_.receive_backend) {
+      // backend arrives first, this means backend init channels already.
+      // read off the already sent values.
+      ctx_->pending_.receive_backend = false;
     } else {
-      this->ctx_->set_state(state_type::receive);
-    }
-    auto temp =
-        boost::asio::async_compose<Token, void(boost::system::error_code,
-                                               std::size_t)>(
-            details::async_receive_op<executor_type>(this, lpBuffer, bufferLen),
-            token, this->get_executor());
-    if (!peer_shutdown) {
-      ctx_->bs_.release();
-    }
-    return std::move(temp);
-  }
+      // frontend arrives first.
 
-  // don't use this if peer does not send shutdown, it will stuck msquic backend
-  // thread.
-  template <BOOST_ASIO_COMPLETION_TOKEN_FOR(void(boost::system::error_code))
-                Token BOOST_ASIO_DEFAULT_COMPLETION_TOKEN_TYPE(executor_type)>
-  BOOST_ASIO_INITFN_AUTO_RESULT_TYPE(Token, void(boost::system::error_code))
-  async_wait_peer_shutdown(BOOST_ASIO_MOVE_ARG(
-      Token) token BOOST_ASIO_DEFAULT_COMPLETION_TOKEN(executor_type)) {
-    ctx_->reset_stream_event();
-    bool already_shutdown = ctx_->get_state() == state_type::peer_shutdown;
-    if (already_shutdown) {
-      // just set the event and callaback will be triggered immediately.
-      ctx_->set_len(0);
-      ctx_->set_stream_event({});
-    } else {
-      // wait for peer shutdown to happen in callback
-      ctx_->set_state(state_type::peer_shutdown);
+      auto [tx, rx] =
+          oneshot::create<std::pair<boost::system::error_code,
+                                    std::vector<std::u8string_view>>>();
+      ctx_->receive_tx_ = std::move(tx);
+      ctx_->receive_rx_ = std::move(rx);
+      // handle stream state.
+      if (ctx_->get_state() != state_type::ok) {
+        boost::system::error_code ec;
+        if (ctx_->get_state() == state_type::peer_shutdown) {
+          // error is success and len is 0;
+        } else if (ctx_->get_state() == state_type::peer_abort) {
+          ec = net::error::make_error_code(
+              net::error::basic_errors::connection_aborted);
+        } else if (ctx_->get_state() == state_type::shutdown_complete) {
+          ec = net::error::make_error_code(
+              net::error::basic_errors::broken_pipe);
+        }
+        ctx_->receive_tx_.send(ec, std::vector<std::u8string_view>{});
+      } else {
+        // backend has work todo.
+        ctx_->pending_.receive_frontend = true;
+      }
     }
 
-    auto temp =
-        boost::asio::async_compose<Token, void(boost::system::error_code)>(
-            details::async_wait_op<executor_type>(&this->ctx_->ev_,
-                                                  &this->ctx_->ec_),
-            token, this->get_executor());
-
-    if (!already_shutdown) {
-      ctx_->bs_.release();
-    }
-    return std::move(temp);
-  }
-
-  template <BOOST_ASIO_COMPLETION_TOKEN_FOR(void(boost::system::error_code))
-                Token BOOST_ASIO_DEFAULT_COMPLETION_TOKEN_TYPE(executor_type)>
-  BOOST_ASIO_INITFN_AUTO_RESULT_TYPE(Token, void(boost::system::error_code))
-  async_wait_peer_abort(BOOST_ASIO_MOVE_ARG(
-      Token) token BOOST_ASIO_DEFAULT_COMPLETION_TOKEN(executor_type)) {
-    // wait for peer shutdown to happen in callback
-    ctx_->set_state(state_type::peer_abort);
-    ctx_->reset_stream_event();
-
-    auto temp =
-        boost::asio::async_compose<Token, void(boost::system::error_code)>(
-            details::async_wait_op<executor_type>(&this->ctx_->ev_,
-                                                  &this->ctx_->ec_),
-            token, this->get_executor());
-    ctx_->bs_.release();
-    return std::move(temp);
+    return net::async_initiate<decltype(token),
+                               void(boost::system::error_code, std::size_t)>(
+        [this, lpBuffer, bufferLen](auto handler) {
+          ctx_->receive_rx_.async_wait(
+              [h = std::move(handler), this, lpBuffer,
+               bufferLen](boost::system::error_code ec) mutable {
+                // if oneshot has error retain it, else use msquic callback
+                // error sent from backend
+                if (ec.failed()) {
+                  std::move(h)(ec, 0);
+                  return;
+                }
+                // get buffers sent from backend
+                auto [ec2, buffs] = ctx_->receive_rx_.get();
+                // copy buffers into out buffer. make a temp variable to advance
+                // during copy
+                std::size_t remaining = bufferLen; // remaining size of outbuff
+                std::size_t copied = 0;            // bytes copied already
+                for (auto &buff : buffs) {
+                  // printf("Copy buffer [%p] %d\n", b.Buffer, b.Length);
+                  std::size_t to_copy = std::min(remaining, buff.size());
+                  if (to_copy == 0) {
+                    continue;
+                  }
+                  errno_t ec_cp =
+                      memcpy_s(lpBuffer, remaining, buff.data(), to_copy);
+                  assert(ec_cp == 0);
+                  DBG_UNREFERENCED_LOCAL_VARIABLE(ec_cp);
+                  remaining -= to_copy;
+                  copied += to_copy;
+                }
+                assert(copied <= bufferLen);
+                // inform msquic to receive next
+                this->receive_complete(copied);
+                std::move(h)(ec2, copied);
+              });
+        },
+        token);
   }
 
   void receive_complete(std::size_t len) {
     this->api_->StreamReceiveComplete(this->h_, len);
   }
 
-  template <BOOST_ASIO_COMPLETION_TOKEN_FOR(void(boost::system::error_code))
-                Token BOOST_ASIO_DEFAULT_COMPLETION_TOKEN_TYPE(executor_type)>
-  BOOST_ASIO_INITFN_AUTO_RESULT_TYPE(Token, void(boost::system::error_code))
-  async_wait_shutdown_complete(BOOST_ASIO_MOVE_ARG(
-      Token) token BOOST_ASIO_DEFAULT_COMPLETION_TOKEN(executor_type)) {
-    ctx_->set_state(state_type::shutdown_complete);
-    ctx_->reset_stream_event();
-
-    auto temp =
-        boost::asio::async_compose<Token, void(boost::system::error_code)>(
-            details::async_wait_op<executor_type>(&this->ctx_->ev_,
-                                                  &this->ctx_->ec_),
-            token, this->get_executor());
-    ctx_->bs_.release();
-    return std::move(temp);
-  }
-
-  void shutdown(_In_ QUIC_STREAM_SHUTDOWN_FLAGS Flags,
+  template <typename Token>
+  auto shutdown(_In_ QUIC_STREAM_SHUTDOWN_FLAGS Flags,
                 _In_ _Pre_defensive_ QUIC_UINT62
                     ErrorCode, // Application defined error code
-                _Out_ boost::system::error_code &ec) {
-    if (this->is_open()) {
+                Token &&token) {
+    assert(this->is_open());
+    std::scoped_lock lock(ctx_->mtx_);
+
+    auto [tx, rx] = oneshot::create<boost::system::error_code>();
+    ctx_->shutdown_tx_ = std::move(tx);
+    ctx_->shutdown_rx_ = std::move(rx);
+
+    boost::system::error_code ec;
+
+    // shutdown is not triggered from front end so need to lock it.
+    if (ctx_->get_state() == state_type::shutdown_complete) {
+      // already shutdown
+      ctx_->shutdown_tx_.send(ec);
+    } else {
       QUIC_STATUS Status =
           this->api_->StreamShutdown(this->h_, Flags, ErrorCode);
       if (QUIC_FAILED(Status)) {
         ec.assign(Status, boost::asio::error::get_system_category());
       }
+      ctx_->shutdown_tx_.send(ec);
     }
+
+    return net::async_initiate<decltype(token),
+                               void(boost::system::error_code)>(
+        [this](auto handler) {
+          ctx_->shutdown_rx_.async_wait(
+              [h = std::move(handler),
+               this](boost::system::error_code ec) mutable {
+                // if oneshot has error retain it, else use msquic callback
+                // error sent from backend
+                if (!ec.failed()) {
+                  ec = ctx_->shutdown_rx_.get();
+                }
+                // TODO: can clean up the channels here.
+                std::move(h)(ec);
+              });
+        },
+        token);
   }
 
   void close() {

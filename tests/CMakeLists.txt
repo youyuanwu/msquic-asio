@@ -55,4 +55,7 @@ add_custom_command(TARGET ${test_name} POST_BUILD
         -E copy_if_different ${_msquic_dll} ${CMAKE_CURRENT_BINARY_DIR}/$<$<CONFIG:Debug>:Debug>$<$<CONFIG:Release>:Release>
 )
 
-add_test(NAME ${test_name} COMMAND ${test_name} WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+add_test(NAME ${test_name} 
+  COMMAND ${test_name} --log_level=all
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)

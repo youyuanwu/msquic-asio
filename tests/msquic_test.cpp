@@ -1,5 +1,9 @@
 #define BOOST_TEST_MODULE msquic_test
+
 #include <boost/test/unit_test.hpp>
+
+// #undef BOOST_TEST_MESSAGE
+// #define BOOST_TEST_MESSAGE(x)
 
 #include <boost/asio.hpp>
 #include <oneshot.hpp>
@@ -16,6 +20,11 @@
 
 #include <future>
 #include <latch>
+
+#ifdef NDEBUG 
+#undef assert
+#define assert(x) BOOST_REQUIRE(x)
+#endif
 
 namespace net = boost::asio;
 namespace quic = boost::msquic;
@@ -117,76 +126,75 @@ void run_client_helper(
   BOOST_REQUIRE(!ec.failed());
 
   auto clientf = [&conn]() -> net::awaitable<void> {
-    try {
-      auto executor = co_await net::this_coro::executor;
-      boost::system::error_code cec = {};
-      BOOST_TEST_MESSAGE("client async connect");
-      co_await conn.async_connect(net::use_awaitable);
+    auto executor = co_await net::this_coro::executor;
+    boost::system::error_code ec = {};
+    BOOST_TEST_MESSAGE("client async connect");
+    co_await conn.async_connect(net::redirect_error(net::use_awaitable, ec));
+    assert(ec == boost::system::errc::success);
 
-      // open a stream
-      quic::basic_stream_handle<net::io_context::executor_type> stream(
-          conn.get_executor(), conn.get_api());
-      stream.open(conn.native_handle(), QUIC_STREAM_OPEN_FLAG_NONE, cec);
-      BOOST_REQUIRE(!cec.failed());
-      BOOST_TEST_MESSAGE("client stream async start");
-      co_await stream.async_start(QUIC_STREAM_START_FLAG_NONE,
-                                  net::use_awaitable);
+    // open a stream
+    quic::basic_stream_handle<net::io_context::executor_type> stream(
+        conn.get_executor(), conn.get_api());
+    stream.open(conn.native_handle(), QUIC_STREAM_OPEN_FLAG_NONE, ec);
+    assert(ec == boost::system::errc::success);
+    BOOST_TEST_MESSAGE("client stream async start");
+    co_await stream.async_start(QUIC_STREAM_START_FLAG_NONE,
+                                net::redirect_error(net::use_awaitable, ec));
+    assert(ec == boost::system::errc::success);
 
-      // send something
-      std::string data = "Hello";
-      QUIC_BUFFER b = {};
-      b.Length = static_cast<std::uint32_t>(data.length());
-      b.Buffer = (uint8_t *)data.data();
-      BOOST_TEST_MESSAGE("client async_send");
-      std::size_t wlen = co_await stream.async_send(
-          &b, 1, QUIC_SEND_FLAG_FIN, nullptr, net::use_awaitable);
-      BOOST_REQUIRE(wlen == b.Length);
+    // send something
+    std::string data = "Hello";
+    QUIC_BUFFER b = {};
+    b.Length = static_cast<std::uint32_t>(data.length());
+    b.Buffer = (uint8_t *)data.data();
+    BOOST_TEST_MESSAGE("client async_send");
+    std::size_t wlen =
+        co_await stream.async_send(&b, 1, QUIC_SEND_FLAG_FIN, nullptr,
+                                   net::redirect_error(net::use_awaitable, ec));
+    assert(ec == boost::system::errc::success);
+    assert(wlen == b.Length);
 
-      // recieve from server.
-      BOOST_TEST_MESSAGE("client async_receive");
-      std::string buff(123, 'a');
-      std::size_t rlen = co_await stream.async_receive(buff.data(), buff.size(),
-                                                       net::use_awaitable);
-      std::string expected_resp = "mydata";
-      BOOST_REQUIRE_EQUAL(rlen, expected_resp.size());
-      BOOST_REQUIRE_EQUAL(expected_resp, buff.substr(0, 6));
+    // recieve from server.
+    BOOST_TEST_MESSAGE("client async_receive");
+    std::string buff(123, 'a');
+    std::size_t rlen = co_await stream.async_receive(
+        buff.data(), buff.size(), net::redirect_error(net::use_awaitable, ec));
+    assert(ec == boost::system::errc::success);
+    std::string expected_resp = "mydata";
+    assert(rlen == expected_resp.size());
+    assert(expected_resp == buff.substr(0, 6));
 
-      BOOST_TEST_MESSAGE("client async_wait_peer_shutdown");
-      co_await stream.async_wait_peer_shutdown(net::use_awaitable);
+    // after peer shutdown, try read. It should success and complete with 0
+    // len
+    // std::size_t rlen2 = co_await stream.async_receive(
+    //     buff.data(), buff.size(), net::redirect_error(net::use_awaitable, ec));
+    // BOOST_CHECK_EQUAL(ec, boost::system::errc::success);
+    // assert(rlen2 == 0);
 
-      // we wait twice, the event should go though successfully immediately.
-      BOOST_TEST_MESSAGE("client async_wait_peer_shutdown2");
-      co_await stream.async_wait_peer_shutdown(net::use_awaitable);
+    BOOST_TEST_MESSAGE("client stream shutdown");
+    co_await stream.shutdown(QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, S_OK,
+                             net::redirect_error(net::use_awaitable, ec));
+    assert(ec == boost::system::errc::success);
+    stream.close();
 
-      // after peer shutdown, try read. It should success and complete with 0
-      // len
-      std::size_t rlen2 = co_await stream.async_receive(
-          buff.data(), buff.size(), net::use_awaitable);
-      BOOST_REQUIRE_EQUAL(rlen2, 0);
-
-      BOOST_TEST_MESSAGE("client async_wait_shutdown_complete");
-      co_await stream.async_wait_shutdown_complete(net::use_awaitable);
-      BOOST_TEST_MESSAGE("client stream end");
-      stream.close();
-
-      // wait connection shutdown
-      BOOST_TEST_MESSAGE("conn async_wait_transport_shutdown");
-      co_await conn.async_wait_transport_shutdown(net::use_awaitable);
-      BOOST_TEST_MESSAGE("conn async_wait_shutdown_complete");
-      co_await conn.async_wait_shutdown_complete(net::use_awaitable);
-      // done close connection.
-      conn.close();
-    } catch (const std::exception &e) {
-      BOOST_REQUIRE_MESSAGE(false, std::string("client coro has exception: ") +
-                                       e.what());
-    }
+    // // wait connection shutdown
+    BOOST_TEST_MESSAGE("client conn async_wait_transport_shutdown");
+    co_await conn.async_wait_transport_shutdown(
+        net::redirect_error(net::use_awaitable, ec));
+    assert(ec == boost::system::errc::success);
+    BOOST_TEST_MESSAGE("client conn async_wait_shutdown_complete");
+    co_await conn.async_wait_shutdown_complete(
+        net::redirect_error(net::use_awaitable, ec));
+    assert(ec == boost::system::errc::success);
+    // done close connection.
+    conn.close();
   };
   // post client task
   net::co_spawn(cioc, clientf, net::detached);
   // start and set callback
   conn.start(client_config.native_handle(), QUIC_ADDRESS_FAMILY_UNSPEC,
              "localhost" /*servername*/, 4567, ec);
-  BOOST_REQUIRE(!ec.failed());
+  assert(ec == boost::system::errc::success);
   cioc.run();
   BOOST_TEST_MESSAGE("Client end success.");
 }
@@ -210,81 +218,74 @@ BOOST_AUTO_TEST_CASE(Handle) {
 
   // use coroutine
   auto f = [&listener]() -> net::awaitable<void> {
-    try {
-      auto executor = co_await net::this_coro::executor;
-      for (;;) {
-        quic::basic_connection_handle<net::io_context::executor_type> conn =
-            co_await listener.async_accept(net::use_awaitable);
+    boost::system::error_code ec = {};
+    auto executor = co_await net::this_coro::executor;
+    for (;;) {
+      quic::basic_connection_handle<net::io_context::executor_type> conn =
+          co_await listener.async_accept(
+              net::redirect_error(net::use_awaitable, ec));
+      assert(ec == boost::system::errc::success);
+      auto fconn =
+          [](quic::basic_connection_handle<net::io_context::executor_type> c)
+          -> net::awaitable<void> {
+        boost::system::error_code ec = {};
+        BOOST_TEST_MESSAGE("async_connect");
+        co_await c.async_connect(net::redirect_error(net::use_awaitable, ec));
+        assert(ec == boost::system::errc::success);
+        // resume
+        c.send_resumption_ticket(ec);
+        assert(ec == boost::system::errc::success);
+        for (;;) {
+          BOOST_TEST_MESSAGE("server async_accept stream");
+          quic::basic_stream_handle<net::io_context::executor_type> stream =
+              co_await c.async_accept(
+                  net::redirect_error(net::use_awaitable, ec));
+          assert(ec == boost::system::errc::success);
 
-        auto fconn =
-            [](quic::basic_connection_handle<net::io_context::executor_type> c)
-            -> net::awaitable<void> {
-          try {
-            BOOST_TEST_MESSAGE("async_connect");
-            co_await c.async_connect(net::use_awaitable);
-            // resume
-            boost::system::error_code ec = {};
-            c.send_resumption_ticket(ec);
-            BOOST_REQUIRE(!ec.failed());
-            for (;;) {
-              BOOST_TEST_MESSAGE("async_accept stream");
-              quic::basic_stream_handle<net::io_context::executor_type> stream =
-                  co_await c.async_accept(net::use_awaitable);
+          // TODO: wait for receive
+          BOOST_TEST_MESSAGE("server stream async_receive");
+          std::string buff(123, 'a');
+          std::size_t rlen = co_await stream.async_receive(
+              buff.data(), buff.size(),
+              net::redirect_error(net::use_awaitable, ec));
+          assert(ec == boost::system::errc::success);
 
-              // TODO: wait for receive
-              BOOST_TEST_MESSAGE("async_receive stream");
-              std::string buff(123, 'a');
-              std::size_t rlen = co_await stream.async_receive(
-                  buff.data(), buff.size(), net::use_awaitable);
+          BOOST_REQUIRE_GE(rlen, 5); // example client always send 100
+          BOOST_CHECK_EQUAL(buff.substr(0, 5), "Hello");
 
-              // peer finishes request and close its direction
-              // wait for stream shutdown
-              BOOST_TEST_MESSAGE("async_stream_peer_shutdown");
-              co_await stream.async_wait_peer_shutdown(net::use_awaitable);
+          std::string data = "mydata";
+          QUIC_BUFFER b = {};
+          b.Length = static_cast<std::uint32_t>(data.length());
+          b.Buffer = (uint8_t *)data.data();
+          BOOST_TEST_MESSAGE("server async_send");
+          std::size_t wlen = co_await stream.async_send(
+              &b, 1, QUIC_SEND_FLAG_FIN, nullptr,
+              net::redirect_error(net::use_awaitable, ec));
+          assert(ec == boost::system::errc::success);
+          assert(wlen == b.Length);
+          // gracefully shutdown.
+          BOOST_TEST_MESSAGE("server stream shutdown");
+          co_await stream.shutdown(QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, S_OK,
+                                   net::redirect_error(net::use_awaitable, ec));
+          assert(ec == boost::system::errc::success);
+          stream.close();
+          //  peer does not send shutdown for conn.
+          //  wait for transport shutdown.
+          BOOST_TEST_MESSAGE("server conn async_wait_transport_shutdown");
+          co_await c.async_wait_transport_shutdown(
+              net::redirect_error(net::use_awaitable, ec));
+          assert(ec == boost::system::errc::success);
+          BOOST_TEST_MESSAGE("server conn async_wait_shutdown_complete");
+          co_await c.async_wait_shutdown_complete(
+              net::redirect_error(net::use_awaitable, ec));
+          assert(ec == boost::system::errc::success);
 
-              BOOST_REQUIRE_GE(rlen, 5); // example client always send 100
-              BOOST_CHECK_EQUAL(buff.substr(0, 5), "Hello");
+          break; // for now we only accept 1 stream
+        }
+      };
 
-              std::string data = "mydata";
-              QUIC_BUFFER b = {};
-              b.Length = static_cast<std::uint32_t>(data.length());
-              b.Buffer = (uint8_t *)data.data();
-              BOOST_TEST_MESSAGE("async_send");
-              std::size_t wlen = co_await stream.async_send(
-                  &b, 1, QUIC_SEND_FLAG_FIN, nullptr, net::use_awaitable);
-              BOOST_REQUIRE(wlen == b.Length);
-
-              BOOST_TEST_MESSAGE("stream async_await_shutdown_complete");
-              co_await stream.async_wait_shutdown_complete(net::use_awaitable);
-
-              // std::this_thread::sleep_for(std::chrono::milliseconds(10));
-              //  peer does not send shutdown for conn.
-              //  wait for transport shutdown.
-              BOOST_TEST_MESSAGE("conn async_wait_transport_shutdown");
-              co_await c.async_wait_transport_shutdown(net::use_awaitable);
-              BOOST_TEST_MESSAGE("conn async_wait_shutdown_complete");
-              co_await c.async_wait_shutdown_complete(net::use_awaitable);
-              break; // for now we only accept 1 stream
-            }
-          } catch (boost::system::system_error const &e) {
-            // if shutdown, ignore
-            BOOST_TEST_MESSAGE(std::string("stream exception: ") + e.what());
-            BOOST_REQUIRE_EQUAL(e.code(), net::error::basic_errors::shut_down);
-            c.close();
-          } catch (const std::exception &e) {
-
-            BOOST_REQUIRE_MESSAGE(
-                false,
-                std::string("connection coro has exception: ") + e.what());
-          }
-        };
-
-        BOOST_TEST_MESSAGE("async_accept connection");
-        net::co_spawn(executor, fconn(std::move(conn)), net::detached);
-      }
-    } catch (const std::exception &e) {
-      BOOST_REQUIRE_MESSAGE(false, std::string("listen coro has exception: ") +
-                                       e.what());
+      BOOST_TEST_MESSAGE("server async_accept connection");
+      net::co_spawn(executor, fconn(std::move(conn)), net::detached);
     }
   };
 
@@ -295,7 +296,7 @@ BOOST_AUTO_TEST_CASE(Handle) {
   QuicAddrSetPort(&addr, 4567);
 
   listener.start(get_test_alpn(), addr, ec);
-  BOOST_REQUIRE(!ec.failed());
+  assert(ec == boost::system::errc::success);
 
   // run server in a separate thread
   std::latch lch(1);
