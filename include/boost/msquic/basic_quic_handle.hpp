@@ -3,6 +3,10 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <msquic.h>
 
+#ifndef MSQUIC_ASIO_MESSAGE
+#define MSQUIC_ASIO_MESSAGE(x)
+#endif
+
 // We roll our own cpp wrapper because the msquic provided one is not move
 // semantic friendly. The cpp wrapper should look like asio::windows wrappers.
 

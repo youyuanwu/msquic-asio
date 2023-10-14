@@ -100,7 +100,7 @@ _IRQL_requires_max_(PASSIVE_LEVEL)
   case QUIC_LISTENER_EVENT_NEW_CONNECTION:
     // wait for front end.
     cpContext->accept_bs_.acquire();
-    BOOST_TEST_MESSAGE("QUIC_LISTENER_EVENT_NEW_CONNECTION");
+    MSQUIC_ASIO_MESSAGE("QUIC_LISTENER_EVENT_NEW_CONNECTION");
     //
     // A new connection is being attempted by a client. For the handshake to
     // proceed, the server must provide a configuration for QUIC to use. The
@@ -111,7 +111,7 @@ _IRQL_requires_max_(PASSIVE_LEVEL)
 
     break;
   case QUIC_LISTENER_EVENT_STOP_COMPLETE:
-    BOOST_TEST_MESSAGE("QUIC_LISTENER_EVENT_STOP_COMPLETE");
+    MSQUIC_ASIO_MESSAGE("QUIC_LISTENER_EVENT_STOP_COMPLETE");
     ec.assign(net::error::basic_errors::shut_down,
               boost::asio::error::get_system_category());
     cpContext->set_conn_event(ec);

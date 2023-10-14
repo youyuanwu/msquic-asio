@@ -96,7 +96,7 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
   QUIC_STATUS Status = QUIC_STATUS_SUCCESS;
   switch (Event->Type) {
   case QUIC_STREAM_EVENT_START_COMPLETE:
-    BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_START_COMPLETE");
+    MSQUIC_ASIO_MESSAGE("QUIC_STREAM_EVENT_START_COMPLETE");
     assert(cpContext->pending_.start);
     ec.assign(Event->START_COMPLETE.Status,
               boost::asio::error::get_system_category());
@@ -104,14 +104,14 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
     cpContext->start_complete_tx_.send(ec);
     break;
   case QUIC_STREAM_EVENT_SEND_COMPLETE:
-    BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_SEND_COMPLETE");
+    MSQUIC_ASIO_MESSAGE("QUIC_STREAM_EVENT_SEND_COMPLETE");
     assert(cpContext->pending_.send);
     cpContext->pending_.send = false;
     cpContext->send_tx_.send(ec);
     break;
   case QUIC_STREAM_EVENT_RECEIVE: {
-    BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_RECEIVE: len " +
-                       std::to_string(Event->RECEIVE.TotalBufferLength));
+    MSQUIC_ASIO_MESSAGE("QUIC_STREAM_EVENT_RECEIVE: len " +
+                        std::to_string(Event->RECEIVE.TotalBufferLength));
     //
     // Data was received from the peer on the stream.
     //
@@ -148,7 +148,7 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
     Status = QUIC_STATUS_PENDING;
   } break;
   case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN: {
-    BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN");
+    MSQUIC_ASIO_MESSAGE("QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN");
     cpContext->set_state(state_type::peer_shutdown);
     // start and read case has complete event notification
     // only handle receive here.
@@ -166,7 +166,7 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
     //  The peer gracefully shut down its send direction of the stream.
   } break;
   case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
-    BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_PEER_SEND_ABORTED");
+    MSQUIC_ASIO_MESSAGE("QUIC_STREAM_EVENT_PEER_SEND_ABORTED");
     cpContext->set_state(state_type::peer_abort);
     // start and read case has complete event notification
     // only handle receive here.
@@ -183,11 +183,12 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
     assert(!cpContext->pending_.send);
     break;
   case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
-    BOOST_TEST_MESSAGE("QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE");
+    MSQUIC_ASIO_MESSAGE("QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE");
     //
     // Both directions of the stream have been shut down and MsQuic is done
     // with the stream. It can now be safely cleaned up.
     //
+    cpContext->set_state(state_type::shutdown_complete);
     if (cpContext->pending_.receive_frontend) {
       // frontend is waiting. This means no more data to receive.
       // send 0 len and error. TODO: figureout ec
@@ -199,6 +200,7 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
     }
     if (cpContext->pending_.shutdown) {
       // front end must have inited the channel
+      cpContext->pending_.shutdown = false;
       ec.clear();
       cpContext->shutdown_tx_.send(ec);
     }
@@ -211,35 +213,6 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
   }
   return Status;
 }
-
-// handler signature void(ec)
-// async wait an action.
-template <typename Executor> class async_wait_op : boost::asio::coroutine {
-public:
-  async_wait_op(event<Executor> *ev, boost::system::error_code *ctx_ec)
-      : ev_(ev), ctx_ec_(ctx_ec) {}
-
-  template <typename Self>
-  void operator()(Self &self, boost::system::error_code ec = {}) {
-    if (ec) {
-      self.complete(ec);
-      return;
-    }
-    ev_->async_wait([self = std::move(self),
-                     c = ctx_ec_](boost::system::error_code ec) mutable {
-      assert(!ec.failed());
-      DBG_UNREFERENCED_LOCAL_VARIABLE(ec);
-      // pass the ctx_ec error from callback
-      self.complete(*c);
-    });
-  }
-
-private:
-  event<Executor> *ev_;
-  // ec shared and set in the callback
-  boost::system::error_code *ctx_ec_;
-};
-
 } // namespace details
 
 template <typename Executor = net::any_io_executor>
@@ -384,6 +357,8 @@ public:
         token);
   }
 
+  // receive works because we always use partial return to callback
+  // so that only 1 receive can be pending at a time.
   template <typename Token>
   auto async_receive(_Out_ LPVOID lpBuffer, _In_ std::size_t bufferLen,
                      Token &&token) {
@@ -469,10 +444,10 @@ public:
   }
 
   template <typename Token>
-  auto shutdown(_In_ QUIC_STREAM_SHUTDOWN_FLAGS Flags,
-                _In_ _Pre_defensive_ QUIC_UINT62
-                    ErrorCode, // Application defined error code
-                Token &&token) {
+  auto async_shutdown(_In_ QUIC_STREAM_SHUTDOWN_FLAGS Flags,
+                      _In_ _Pre_defensive_ QUIC_UINT62
+                          ErrorCode, // Application defined error code
+                      Token &&token) {
     assert(this->is_open());
     std::scoped_lock lock(ctx_->mtx_);
 
@@ -491,8 +466,10 @@ public:
           this->api_->StreamShutdown(this->h_, Flags, ErrorCode);
       if (QUIC_FAILED(Status)) {
         ec.assign(Status, boost::asio::error::get_system_category());
+        ctx_->shutdown_tx_.send(ec);
+      } else {
+        ctx_->pending_.shutdown = true;
       }
-      ctx_->shutdown_tx_.send(ec);
     }
 
     return net::async_initiate<decltype(token),

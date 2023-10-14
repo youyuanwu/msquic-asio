@@ -2,8 +2,15 @@
 
 #include <boost/test/unit_test.hpp>
 
-// #undef BOOST_TEST_MESSAGE
-// #define BOOST_TEST_MESSAGE(x)
+// global logger
+#include <mutex>
+std::mutex _msquic_asio_mtx;
+void _log_message(std::string_view sv) {
+  std::scoped_lock lk(_msquic_asio_mtx);
+  BOOST_TEST_MESSAGE(sv);
+}
+
+#define MSQUIC_ASIO_MESSAGE(x) _log_message(x)
 
 #include <boost/asio.hpp>
 #include <oneshot.hpp>
@@ -21,7 +28,7 @@
 #include <future>
 #include <latch>
 
-#ifdef NDEBUG 
+#ifdef NDEBUG
 #undef assert
 #define assert(x) BOOST_REQUIRE(x)
 #endif
@@ -125,11 +132,16 @@ void run_client_helper(
   conn.open(reg.native_handle(), ec);
   BOOST_REQUIRE(!ec.failed());
 
-  auto clientf = [&conn]() -> net::awaitable<void> {
+  auto clientf = [&conn, &client_config]() -> net::awaitable<void> {
     auto executor = co_await net::this_coro::executor;
     boost::system::error_code ec = {};
-    BOOST_TEST_MESSAGE("client async connect");
-    co_await conn.async_connect(net::redirect_error(net::use_awaitable, ec));
+    MSQUIC_ASIO_MESSAGE("client async connect");
+
+    assert(ec == boost::system::errc::success);
+    co_await conn.async_start(client_config.native_handle(),
+                              QUIC_ADDRESS_FAMILY_UNSPEC,
+                              "localhost" /*servername*/, 4567,
+                              net::redirect_error(net::use_awaitable, ec));
     assert(ec == boost::system::errc::success);
 
     // open a stream
@@ -137,7 +149,7 @@ void run_client_helper(
         conn.get_executor(), conn.get_api());
     stream.open(conn.native_handle(), QUIC_STREAM_OPEN_FLAG_NONE, ec);
     assert(ec == boost::system::errc::success);
-    BOOST_TEST_MESSAGE("client stream async start");
+    MSQUIC_ASIO_MESSAGE("client stream async start");
     co_await stream.async_start(QUIC_STREAM_START_FLAG_NONE,
                                 net::redirect_error(net::use_awaitable, ec));
     assert(ec == boost::system::errc::success);
@@ -147,7 +159,7 @@ void run_client_helper(
     QUIC_BUFFER b = {};
     b.Length = static_cast<std::uint32_t>(data.length());
     b.Buffer = (uint8_t *)data.data();
-    BOOST_TEST_MESSAGE("client async_send");
+    MSQUIC_ASIO_MESSAGE("client async_send");
     std::size_t wlen =
         co_await stream.async_send(&b, 1, QUIC_SEND_FLAG_FIN, nullptr,
                                    net::redirect_error(net::use_awaitable, ec));
@@ -155,7 +167,7 @@ void run_client_helper(
     assert(wlen == b.Length);
 
     // recieve from server.
-    BOOST_TEST_MESSAGE("client async_receive");
+    MSQUIC_ASIO_MESSAGE("client async_receive");
     std::string buff(123, 'a');
     std::size_t rlen = co_await stream.async_receive(
         buff.data(), buff.size(), net::redirect_error(net::use_awaitable, ec));
@@ -167,36 +179,29 @@ void run_client_helper(
     // after peer shutdown, try read. It should success and complete with 0
     // len
     // std::size_t rlen2 = co_await stream.async_receive(
-    //     buff.data(), buff.size(), net::redirect_error(net::use_awaitable, ec));
+    //     buff.data(), buff.size(), net::redirect_error(net::use_awaitable,
+    //     ec));
     // BOOST_CHECK_EQUAL(ec, boost::system::errc::success);
     // assert(rlen2 == 0);
 
-    BOOST_TEST_MESSAGE("client stream shutdown");
-    co_await stream.shutdown(QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, S_OK,
-                             net::redirect_error(net::use_awaitable, ec));
+    MSQUIC_ASIO_MESSAGE("client stream shutdown");
+    co_await stream.async_shutdown(QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, S_OK,
+                                   net::redirect_error(net::use_awaitable, ec));
     assert(ec == boost::system::errc::success);
     stream.close();
 
-    // // wait connection shutdown
-    BOOST_TEST_MESSAGE("client conn async_wait_transport_shutdown");
-    co_await conn.async_wait_transport_shutdown(
-        net::redirect_error(net::use_awaitable, ec));
+    MSQUIC_ASIO_MESSAGE("client conn shutdown");
+    co_await conn.async_shutdown(QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0,
+                                 net::redirect_error(net::use_awaitable, ec));
     assert(ec == boost::system::errc::success);
-    BOOST_TEST_MESSAGE("client conn async_wait_shutdown_complete");
-    co_await conn.async_wait_shutdown_complete(
-        net::redirect_error(net::use_awaitable, ec));
-    assert(ec == boost::system::errc::success);
+
     // done close connection.
     conn.close();
   };
   // post client task
   net::co_spawn(cioc, clientf, net::detached);
-  // start and set callback
-  conn.start(client_config.native_handle(), QUIC_ADDRESS_FAMILY_UNSPEC,
-             "localhost" /*servername*/, 4567, ec);
-  assert(ec == boost::system::errc::success);
   cioc.run();
-  BOOST_TEST_MESSAGE("Client end success.");
+  MSQUIC_ASIO_MESSAGE("Client end success.");
 }
 
 // --log_level=all --detect_memory_leak=0 --run_test=test_quic/Handle
@@ -229,21 +234,22 @@ BOOST_AUTO_TEST_CASE(Handle) {
           [](quic::basic_connection_handle<net::io_context::executor_type> c)
           -> net::awaitable<void> {
         boost::system::error_code ec = {};
-        BOOST_TEST_MESSAGE("async_connect");
+        MSQUIC_ASIO_MESSAGE("server async_connect");
         co_await c.async_connect(net::redirect_error(net::use_awaitable, ec));
         assert(ec == boost::system::errc::success);
         // resume
+        MSQUIC_ASIO_MESSAGE("server send_resumption_ticket");
         c.send_resumption_ticket(ec);
         assert(ec == boost::system::errc::success);
         for (;;) {
-          BOOST_TEST_MESSAGE("server async_accept stream");
+          MSQUIC_ASIO_MESSAGE("server async_accept stream");
           quic::basic_stream_handle<net::io_context::executor_type> stream =
               co_await c.async_accept(
                   net::redirect_error(net::use_awaitable, ec));
           assert(ec == boost::system::errc::success);
 
           // TODO: wait for receive
-          BOOST_TEST_MESSAGE("server stream async_receive");
+          MSQUIC_ASIO_MESSAGE("server stream async_receive");
           std::string buff(123, 'a');
           std::size_t rlen = co_await stream.async_receive(
               buff.data(), buff.size(),
@@ -257,26 +263,22 @@ BOOST_AUTO_TEST_CASE(Handle) {
           QUIC_BUFFER b = {};
           b.Length = static_cast<std::uint32_t>(data.length());
           b.Buffer = (uint8_t *)data.data();
-          BOOST_TEST_MESSAGE("server async_send");
+          MSQUIC_ASIO_MESSAGE("server async_send");
           std::size_t wlen = co_await stream.async_send(
               &b, 1, QUIC_SEND_FLAG_FIN, nullptr,
               net::redirect_error(net::use_awaitable, ec));
           assert(ec == boost::system::errc::success);
           assert(wlen == b.Length);
           // gracefully shutdown.
-          BOOST_TEST_MESSAGE("server stream shutdown");
-          co_await stream.shutdown(QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, S_OK,
-                                   net::redirect_error(net::use_awaitable, ec));
-          assert(ec == boost::system::errc::success);
-          stream.close();
-          //  peer does not send shutdown for conn.
-          //  wait for transport shutdown.
-          BOOST_TEST_MESSAGE("server conn async_wait_transport_shutdown");
-          co_await c.async_wait_transport_shutdown(
+          MSQUIC_ASIO_MESSAGE("server stream shutdown");
+          co_await stream.async_shutdown(
+              QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, S_OK,
               net::redirect_error(net::use_awaitable, ec));
           assert(ec == boost::system::errc::success);
-          BOOST_TEST_MESSAGE("server conn async_wait_shutdown_complete");
-          co_await c.async_wait_shutdown_complete(
+          // stream.close();
+          MSQUIC_ASIO_MESSAGE("server conn shutdown");
+          co_await c.async_shutdown(
+              QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0,
               net::redirect_error(net::use_awaitable, ec));
           assert(ec == boost::system::errc::success);
 
@@ -284,7 +286,7 @@ BOOST_AUTO_TEST_CASE(Handle) {
         }
       };
 
-      BOOST_TEST_MESSAGE("server async_accept connection");
+      MSQUIC_ASIO_MESSAGE("server async_accept connection");
       net::co_spawn(executor, fconn(std::move(conn)), net::detached);
     }
   };
