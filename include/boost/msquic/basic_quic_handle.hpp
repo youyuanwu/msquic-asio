@@ -13,7 +13,7 @@
 namespace boost {
 namespace msquic {
 
-// namespace net = boost::asio;
+namespace net = boost::asio;
 
 template <typename Executor = net::any_io_executor> class basic_quic_handle {
 public:

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "boost/msquic/basic_stream_handle.hpp"
-#include "boost/msquic/event.hpp"
 #include <boost/asio/any_io_executor.hpp>
 #include <oneshot.hpp>
 
@@ -238,37 +237,6 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
   }
   return QUIC_STATUS_SUCCESS;
 }
-
-// handler signature: void(ec, conn)
-template <typename Executor>
-class async_stream_move_accept_op : boost::asio::coroutine {
-public:
-  async_stream_move_accept_op(basic_stream_handle<Executor> *conn,
-                              event<Executor> *ev,
-                              boost::system::error_code *ctx_ec)
-      : conn_(conn), ev_(ev), ctx_ec_(ctx_ec) {}
-
-  template <typename Self>
-  void operator()(Self &self, boost::system::error_code ec = {}) {
-    if (ec) {
-      self.complete(ec, std::move(*conn_));
-      return;
-    }
-    ev_->async_wait([self = std::move(self), c = ctx_ec_,
-                     conn = conn_](boost::system::error_code ec) mutable {
-      assert(!ec.failed());
-      DBG_UNREFERENCED_LOCAL_VARIABLE(ec);
-      // pass the ctx_ec and move connection to the handler
-      self.complete(*c, std::move(*conn));
-    });
-  }
-
-private:
-  basic_stream_handle<Executor> *conn_;
-  event<Executor> *ev_;
-  // ec shared and set in the callback
-  boost::system::error_code *ctx_ec_;
-};
 
 } // namespace details
 

@@ -9,7 +9,7 @@
 #include "boost/msquic/basic_connection_handle.hpp"
 #include "boost/msquic/basic_quic_handle.hpp"
 
-#include "boost/msquic/event.hpp"
+#include "oneshot.hpp"
 
 namespace boost {
 namespace msquic {
@@ -24,9 +24,17 @@ public:
   typedef Executor executor_type;
   typedef HQUIC native_handle_type;
 
+  struct pending_actions {
+    bool accept;
+    bool stop;
+  };
+
+  enum class state { ok, stopped };
+
   AsioServerListenerCtx(const executor_type &ex, const QUIC_API_TABLE *api,
                         basic_config_handle<executor_type> &config)
-      : ex_(ex), ch_(ex, api), ev_(ex), config_(config), accept_bs_(0) {
+      : ex_(ex), api_(api), config_(config), accept_bs_(0), state_(state::ok),
+        pending_() {
     assert(api != nullptr);
   }
 
@@ -35,45 +43,33 @@ public:
 
   executor_type get_executor() { return ex_; }
 
-  basic_connection_handle<executor_type> &get_conn_holder() { return ch_; }
-
-  // incomming connection handle provided in the callback
-  void init_conn_holder(native_handle_type h) {
-    // assign handle
-    ch_.assign(h);
-    // set callback
-    // if we set callback here it can be immediately triggered???
-    ch_.set_callback();
-    // set config
-    ch_.set_config(this->config_.native_handle());
-  }
-
-  void set_conn_event(boost::system::error_code ec) {
-    ec_ = ec;
-    ev_.set();
-  }
-
-  void reset_conn_event() {
-    ec_.clear();
-    ev_.reset();
-  }
-
   executor_type ex_;
-  // placeholder connection for accept. Intended for std::move to handlers.
-  basic_connection_handle<executor_type> ch_;
 
   basic_config_handle<executor_type> &config_;
 
-  event<executor_type> ev_;
+  std::mutex mtx_;
 
-  // error code saved from callback
-  boost::system::error_code ec_;
+  pending_actions pending_;
+
+  state state_;
 
   // semaphore for accept.
   // the first accept does not need semaphore if start of listener is called
   // after accept is initiated. But the subsquent new connection needs this to
   // synchonize.
   std::binary_semaphore accept_bs_;
+
+  oneshot::sender<std::pair<boost::system::error_code,
+                            basic_connection_handle<executor_type>>>
+      accept_tx_;
+  oneshot::receiver<std::pair<boost::system::error_code,
+                              basic_connection_handle<executor_type>>>
+      accept_rx_;
+
+  oneshot::sender<boost::system::error_code> stop_tx_;
+  oneshot::receiver<boost::system::error_code> stop_rx_;
+
+  const QUIC_API_TABLE *api_;
 };
 
 //
@@ -85,36 +81,62 @@ _IRQL_requires_max_(PASSIVE_LEVEL)
     AsioServerListenerCallback(_In_ HQUIC Listener, _In_opt_ void *Context,
                                _Inout_ QUIC_LISTENER_EVENT *Event) {
   typedef Executor executor_type;
+  typedef details::AsioServerListenerCtx<executor_type>::state state_type;
   UNREFERENCED_PARAMETER(Listener);
   UNREFERENCED_PARAMETER(Context);
   UNREFERENCED_PARAMETER(Event);
   assert(Context != nullptr);
   AsioServerListenerCtx<executor_type> *cpContext;
   cpContext = (AsioServerListenerCtx<executor_type> *)Context;
+
+  // allow 1 callback at a time
+  std::unique_lock lock(cpContext->mtx_);
+
   boost::system::error_code ec = {};
 
   DBG_UNREFERENCED_LOCAL_VARIABLE(cpContext);
 
   QUIC_STATUS Status = QUIC_STATUS_SUCCESS;
   switch (Event->Type) {
-  case QUIC_LISTENER_EVENT_NEW_CONNECTION:
+  case QUIC_LISTENER_EVENT_NEW_CONNECTION: {
+    lock.unlock(); // let frontend proceed.
     // wait for front end.
     cpContext->accept_bs_.acquire();
     MSQUIC_ASIO_MESSAGE("QUIC_LISTENER_EVENT_NEW_CONNECTION");
+    assert(cpContext->pending_.accept);
+    cpContext->pending_.accept = false;
     //
     // A new connection is being attempted by a client. For the handshake to
     // proceed, the server must provide a configuration for QUIC to use. The
     // app MUST set the callback handler before returning.
     assert(Event->NEW_CONNECTION.Connection != nullptr);
-    cpContext->init_conn_holder(Event->NEW_CONNECTION.Connection);
-    cpContext->set_conn_event(ec);
+    // cpContext->init_conn_holder(Event->NEW_CONNECTION.Connection);
+    // cpContext->set_conn_event(ec);
+    // make a new conn
+    basic_connection_handle<executor_type> conn(cpContext->ex_,
+                                                cpContext->api_);
+    conn.assign(Event->NEW_CONNECTION.Connection);
+    conn.set_callback();
+    conn.set_config(cpContext->config_.native_handle());
+    cpContext->accept_tx_.send(ec, std::move(conn));
 
-    break;
+  } break;
   case QUIC_LISTENER_EVENT_STOP_COMPLETE:
     MSQUIC_ASIO_MESSAGE("QUIC_LISTENER_EVENT_STOP_COMPLETE");
+    cpContext->state_ = state_type::stopped;
     ec.assign(net::error::basic_errors::shut_down,
               boost::asio::error::get_system_category());
-    cpContext->set_conn_event(ec);
+    if (cpContext->pending_.accept) {
+      cpContext->pending_.accept = false;
+      basic_connection_handle<executor_type> dummy(cpContext->ex_,
+                                                   cpContext->api_);
+      cpContext->accept_tx_.send(ec, std::move(dummy));
+    }
+    if (cpContext->pending_.stop) {
+      cpContext->pending_.stop = false;
+      ec.clear();
+      cpContext->stop_tx_.send(ec);
+    }
     break;
   default:
     assert(false);
@@ -122,36 +144,6 @@ _IRQL_requires_max_(PASSIVE_LEVEL)
   }
   return Status;
 }
-
-// handler signature: void(ec, conn)
-template <typename Executor>
-class async_move_accept_op : boost::asio::coroutine {
-public:
-  async_move_accept_op(basic_connection_handle<Executor> *conn,
-                       event<Executor> *ev, boost::system::error_code *ctx_ec)
-      : conn_(conn), ev_(ev), ctx_ec_(ctx_ec) {}
-
-  template <typename Self>
-  void operator()(Self &self, boost::system::error_code ec = {}) {
-    if (ec) {
-      self.complete(ec, std::move(*conn_));
-      return;
-    }
-    ev_->async_wait([self = std::move(self), c = ctx_ec_,
-                     conn = conn_](boost::system::error_code ec) mutable {
-      assert(!ec.failed());
-      DBG_UNREFERENCED_LOCAL_VARIABLE(ec);
-      // pass the ctx_ec and move connection to the handler
-      self.complete(*c, std::move(*conn));
-    });
-  }
-
-private:
-  basic_connection_handle<Executor> *conn_;
-  event<Executor> *ev_;
-  // ec shared and set in the callback
-  boost::system::error_code *ctx_ec_;
-};
 
 } // namespace details
 
@@ -161,10 +153,13 @@ public:
   /// The type of the executor associated with the object.
   typedef Executor executor_type;
   typedef HQUIC native_handle_type;
+  typedef details::AsioServerListenerCtx<executor_type>::state state_type;
 
   basic_listener_handle(const executor_type &ex, const QUIC_API_TABLE *api,
                         basic_config_handle<executor_type> &config)
-      : basic_quic_handle<executor_type>(ex, api), ctx_(ex, api, config) {}
+      : basic_quic_handle<executor_type>(ex, api),
+        ctx_(std::make_unique<details::AsioServerListenerCtx<executor_type>>(
+            ex, api, config)) {}
 
   ~basic_listener_handle() { this->close(); }
 
@@ -174,7 +169,7 @@ public:
             boost::system::error_code &_Out_ ec) {
     QUIC_STATUS Status = this->api_->ListenerOpen(
         registration, details::AsioServerListenerCallback<executor_type>,
-        (void *)&ctx_, &this->h_);
+        (void *)ctx_.get(), &this->h_);
     if (QUIC_FAILED(Status)) {
       ec.assign(Status, boost::asio::error::get_system_category());
     }
@@ -189,8 +184,6 @@ public:
     }
   }
 
-  // TODO: implement connection first and then this async accept
-
   template <BOOST_ASIO_COMPLETION_TOKEN_FOR(
       void(boost::system::error_code, basic_connection_handle<executor_type>))
                 MoveAcceptToken BOOST_ASIO_DEFAULT_COMPLETION_TOKEN_TYPE(
@@ -201,16 +194,81 @@ public:
   async_accept(BOOST_ASIO_MOVE_ARG(MoveAcceptToken)
                    token BOOST_ASIO_DEFAULT_COMPLETION_TOKEN(executor_type)) {
 
-    this->ctx_.reset_conn_event();
+    std::scoped_lock lock(ctx_->mtx_);
+    assert(!ctx_->pending_.accept);
+    auto [tx, rx] =
+        oneshot::create<std::pair<boost::system::error_code,
+                                  basic_connection_handle<executor_type>>>();
+    ctx_->accept_tx_ = std::move(tx);
+    ctx_->accept_rx_ = std::move(rx);
+    if (ctx_->state_ == state_type::stopped) {
+      boost::system::error_code ec;
+      ec.assign(net::error::connection_aborted,
+                boost::asio::error::get_system_category());
+      basic_connection_handle<executor_type> dummy(this->ex_, this->api_);
+      ctx_->accept_tx_.send(ec, std::move(dummy));
+    } else {
+      ctx_->pending_.accept = true;
+      // backend can go ahead.
+      ctx_->accept_bs_.release();
+    }
 
-    auto temp = boost::asio::async_compose<
-        MoveAcceptToken, void(boost::system::error_code,
-                              basic_connection_handle<executor_type>)>(
-        details::async_move_accept_op<executor_type>(
-            &this->ctx_.ch_, &this->ctx_.ev_, &this->ctx_.ec_),
-        token, this->get_executor());
-    this->ctx_.accept_bs_.release();
-    return std::move(temp);
+    return net::async_initiate<decltype(token),
+                               void(boost::system::error_code,
+                                    basic_connection_handle<executor_type>)>(
+        [this](auto handler) {
+          ctx_->accept_rx_.async_wait(
+              [h = std::move(handler),
+               this](boost::system::error_code ec) mutable {
+                // if oneshot has error retain it, else use msquic callback
+                // error sent from backend
+                if (ec.failed()) {
+                  basic_connection_handle<executor_type> dummy(this->ex_,
+                                                               this->api_);
+                  std::move(h)(ec, std::move(dummy));
+                  return;
+                }
+                auto [ec2, conn] = std::move(ctx_->accept_rx_.get());
+                std::move(h)(ec2, std::move(conn));
+              });
+        },
+        token);
+  }
+
+  template <typename Token> auto async_stop(Token &&token) {
+    std::unique_lock lock(ctx_->mtx_);
+    assert(!ctx_->pending_.stop);
+
+    auto [tx, rx] = oneshot::create<boost::system::error_code>();
+    ctx_->stop_tx_ = std::move(tx);
+    ctx_->stop_rx_ = std::move(rx);
+
+    if (ctx_->state_ == state_type::stopped) {
+      // already shutdown
+      ctx_->stop_tx_.send(boost::system::error_code{});
+    } else {
+      // shutdown returns void
+      ctx_->pending_.stop = true;
+      // This will wait for stop callback to finish, so we need to release lock
+      // here.
+      lock.unlock();
+      this->api_->ListenerStop(this->h_);
+    }
+    return net::async_initiate<decltype(token),
+                               void(boost::system::error_code)>(
+        [this](auto handler) {
+          ctx_->stop_rx_.async_wait([h = std::move(handler), this](
+                                        boost::system::error_code ec) mutable {
+            // if oneshot has error retain it, else use msquic callback
+            // error sent from backend
+            if (!ec.failed()) {
+              ec = ctx_->stop_rx_.get();
+            }
+            // TODO: can clean up the channels here.
+            std::move(h)(ec);
+          });
+        },
+        token);
   }
 
   void close() {
@@ -221,7 +279,7 @@ public:
   }
 
 private:
-  details::AsioServerListenerCtx<executor_type> ctx_;
+  std::unique_ptr<details::AsioServerListenerCtx<executor_type>> ctx_;
 };
 
 } // namespace msquic
