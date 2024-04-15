@@ -5,10 +5,10 @@ project(msquic-asio)
 include(cmake/clang-format.cmake)
 
 if(WIN32)
-  set(release_url "https://github.com/microsoft/msquic/releases/download/v2.2.2/msquic_windows_x64_Release_schannel.zip")
+  set(release_url "https://github.com/microsoft/msquic/releases/download/v2.3.5/msquic_windows_x64_Release_schannel.zip")
 else()
   # linux
-  set(release_url "https://github.com/microsoft/msquic/releases/download/v2.2.2/msquic_linux_x64_Release_openssl.zip")
+  set(release_url "https://github.com/microsoft/msquic/releases/download/v2.3.5/msquic_linux_x64_Release_openssl.zip")
   find_package(OpenSSL REQUIRED)
   # openssl needs version 1.1. ubuntu 20.04 has it, 22.04 is too new.
 endif(WIN32)
@@ -92,7 +92,7 @@ message(STATUS "fetching ashtum_oneshot")
 include(FetchContent)
 FetchContent_Declare(ashtum_oneshot
     GIT_REPOSITORY https://github.com/youyuanwu/oneshot
-    GIT_TAG 7516175b7f624b2ae137d0bca972d57c1f65814b
+    GIT_TAG bf93793ad0b480599d32209c39e47f2dbb5abbe5
 )
 FetchContent_GetProperties(ashtum_oneshot)
 if(NOT ashtum_oneshot_POPULATED)
