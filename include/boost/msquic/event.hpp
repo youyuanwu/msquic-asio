@@ -54,7 +54,7 @@ public:
     if (!ok) {
       auto ec = boost::system::error_code(
           ::GetLastError(), boost::asio::error::get_system_category());
-      BOOST_TEST_MESSAGE(std::string("set event failed: ") + ec.message());
+      MSQUIC_ASIO_MESSAGE(std::string("set event failed: ") + ec.message());
       BOOST_ASSERT(false);
     }
 

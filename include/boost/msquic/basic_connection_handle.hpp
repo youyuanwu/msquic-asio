@@ -124,8 +124,9 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
     } else {
       // printf("[conn][%p] Shut down by transport, 0x%x\n", Connection,
       //        Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status);
-      MSQUIC_ASIO_MESSAGE(
-          std::format("QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT error 0x{:x}", (std::uint32_t)Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status));
+      MSQUIC_ASIO_MESSAGE(std::format(
+          "QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT error 0x{:x}",
+          (std::uint32_t)Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status));
     }
     //
     // The connection has been shut down by the transport. Generally, this

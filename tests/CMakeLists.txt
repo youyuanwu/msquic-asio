@@ -25,10 +25,6 @@ message(STATUS "Using TEST_CERT_HASH ${TEST_CERT_HASH}")
 
 # remove: Get-ChildItem Cert:\CurrentUser\My\ | Where-Object -Property FriendlyName -EQ -Value MsQuic-Test | Remove-Item
 
-
-set(Boost_USE_STATIC_LIBS ON) # use static boost
-find_package(Boost REQUIRED COMPONENTS unit_test_framework )
-
 # pthread
 find_package(Threads REQUIRED)
 
@@ -50,7 +46,7 @@ target_compile_definitions(${test_name}
 )
 
 
-target_link_libraries(${test_name} PRIVATE Threads::Threads Boost::unit_test_framework Boost::disable_autolinking msquic-asio)
+target_link_libraries(${test_name} PRIVATE Threads::Threads Boost::ut msquic-asio)
 set_property(TARGET ${test_name} PROPERTY CXX_STANDARD 20)
 
 add_test(NAME ${test_name} 

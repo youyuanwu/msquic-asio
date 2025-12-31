@@ -2,7 +2,6 @@
 
 #include "boost/msquic/basic_config_handle.hpp"
 #include "boost/msquic/basic_registration_handle.hpp"
-#include <boost/test/unit_test.hpp>
 
 #ifndef TEST_CERT_HASH
 #error "test cert not found"
@@ -25,8 +24,8 @@ void set_registration_handle(quic::basic_registration_handle<Executor> &reg) {
   const QUIC_REGISTRATION_CONFIG RegConfig = {
       "quicsample", QUIC_EXECUTION_PROFILE_LOW_LATENCY};
   reg.open(RegConfig, ec);
-  BOOST_REQUIRE(!ec.failed());
-  BOOST_REQUIRE(reg.is_open());
+  MSQUIC_ASIO_TEST_REQUIRE_EQUAL(ec.failed(), false);
+  MSQUIC_ASIO_TEST_REQUIRE_EQUAL(reg.is_open(), true);
 }
 
 template <typename Executor>
@@ -53,10 +52,10 @@ void config_test_client_handle(quic::basic_config_handle<Executor> &config,
   CredConfig.Flags |= QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
 
   config.open(reg, Settings, get_test_alpn(), ec);
-  BOOST_REQUIRE(!ec.failed());
+  MSQUIC_ASIO_TEST_REQUIRE_EQUAL(ec.failed(), false);
   // fix me:
   config.load_cred2(CredConfig, ec);
-  BOOST_REQUIRE(!ec.failed());
+  MSQUIC_ASIO_TEST_REQUIRE_EQUAL(ec.failed(), false);
 }
 
 template <typename Executor>
@@ -86,7 +85,7 @@ void config_test_server_handle(quic::basic_config_handle<Executor> &config,
     Settings.IsSet.PeerBidiStreamCount = TRUE;
 
     config.open(reg, Settings, get_test_alpn(), ec);
-    BOOST_REQUIRE(!ec.failed());
+    MSQUIC_ASIO_TEST_REQUIRE_EQUAL(ec.failed(), false);
     QUIC_CREDENTIAL_CONFIG Config = {};
     QUIC_CERTIFICATE_HASH certHash = {};
 
@@ -103,6 +102,6 @@ void config_test_server_handle(quic::basic_config_handle<Executor> &config,
     Config.CertificateHash = &certHash;
 
     config.load_cred2(Config, ec);
-    BOOST_REQUIRE(!ec.failed());
+    MSQUIC_ASIO_TEST_REQUIRE_EQUAL(ec.failed(), false);
   }
 }

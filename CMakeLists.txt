@@ -46,7 +46,8 @@ endif()
 
 set(Boost_USE_STATIC_LIBS ON) # use static boost
 set(Boost_NO_WARN_NEW_VERSIONS ON)
-find_package(Boost REQUIRED log unit_test_framework headers)
+find_package(Boost REQUIRED headers)
+find_package(ut CONFIG REQUIRED)
 
 # third party oneshot asio lib
 message(STATUS "fetching ashtum_oneshot")
