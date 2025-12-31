@@ -1,6 +1,7 @@
 #define BOOST_TEST_MODULE msquic_test
 
 #include <boost/test/unit_test.hpp>
+#include <format>
 
 // global logger
 #include <mutex>
@@ -64,7 +65,7 @@ BOOST_AUTO_TEST_CASE(Basic) {
   // reset and do it again.
   i = 10;
   ev.reset();
-  ioc.reset();
+  ioc.restart();
 
   auto starttime = std::chrono::steady_clock::now();
   ev.async_wait([&i, starttime](const boost::system::error_code &ec) {
@@ -129,13 +130,14 @@ void run_client_helper(
   quic::basic_connection_handle<net::io_context::executor_type> conn(
       cioc.get_executor(), api.get());
   // open connection
+  MSQUIC_ASIO_MESSAGE("client conn open");
   conn.open(reg.native_handle(), ec);
   BOOST_REQUIRE(!ec.failed());
 
   auto clientf = [&conn, &client_config]() -> net::awaitable<void> {
     auto executor = co_await net::this_coro::executor;
     boost::system::error_code ec = {};
-    MSQUIC_ASIO_MESSAGE("client async connect");
+    MSQUIC_ASIO_MESSAGE("client async start");
 
     MSQUIC_ASIO_TEST_REQUIRE_EQUAL(ec, boost::system::errc::success);
     co_await conn.async_start(client_config.native_handle(),
@@ -147,6 +149,7 @@ void run_client_helper(
     // open a stream
     quic::basic_stream_handle<net::io_context::executor_type> stream(
         conn.get_executor(), conn.get_api());
+    MSQUIC_ASIO_MESSAGE("client stream open");
     stream.open(conn.native_handle(), QUIC_STREAM_OPEN_FLAG_NONE, ec);
     MSQUIC_ASIO_TEST_REQUIRE_EQUAL(ec, boost::system::errc::success);
     MSQUIC_ASIO_MESSAGE("client stream async start");
@@ -348,12 +351,12 @@ BOOST_AUTO_TEST_CASE(Handle) {
 }
 
 // --log_level=all --detect_memory_leak=0 --run_test=test_quic/Client
-BOOST_AUTO_TEST_CASE(Client) {
+BOOST_AUTO_TEST_CASE(Client, *boost::unit_test::disabled()) {
   net::io_context ioc;
   quic::api api;
   quic::basic_registration_handle reg(ioc.get_executor(), api.get());
   set_registration_handle(reg);
-  // run_client_helper(api, reg);
+  run_client_helper(api, reg);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

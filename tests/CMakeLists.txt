@@ -53,11 +53,6 @@ target_compile_definitions(${test_name}
 target_link_libraries(${test_name} PRIVATE Threads::Threads Boost::unit_test_framework Boost::disable_autolinking msquic-asio)
 set_property(TARGET ${test_name} PROPERTY CXX_STANDARD 20)
 
-add_custom_command(TARGET ${test_name} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} 
-        -E copy_if_different ${_msquic_dll} ${CMAKE_CURRENT_BINARY_DIR}/$<$<CONFIG:Debug>:Debug>$<$<CONFIG:Release>:Release>
-)
-
 add_test(NAME ${test_name} 
   COMMAND ${test_name} --log_level=all
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}

@@ -1,54 +1,24 @@
 cmake_minimum_required(VERSION 3.16)
 
+set(msquic_asio_MAIN_PROJECT OFF)
+if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    set(msquic_asio_MAIN_PROJECT ON)
+endif()
+
+if(msquic_asio_MAIN_PROJECT AND NOT MSQUIC_ASIO_CI_FORMAT)
+    # configure vcpkg
+    # we use CmakePresets.json to point to vcpkg
+    if ("$ENV{VCPKG_ROOT}" STREQUAL "")
+    message(FATAL_ERROR "VCPKG_ROOT not found")
+    endif()
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+endif()
+
 project(msquic-asio)
 
 include(cmake/clang-format.cmake)
 
-if(WIN32)
-  set(release_url "https://github.com/microsoft/msquic/releases/download/v2.3.5/msquic_windows_x64_Release_schannel.zip")
-else()
-  # linux
-  set(release_url "https://github.com/microsoft/msquic/releases/download/v2.3.5/msquic_linux_x64_Release_openssl.zip")
-  find_package(OpenSSL REQUIRED)
-  # openssl needs version 1.1. ubuntu 20.04 has it, 22.04 is too new.
-endif(WIN32)
-
-message(STATUS "fetching msquic_release " ${release_url})
-include(FetchContent)
-FetchContent_Declare(
-  msquic_release
-  DOWNLOAD_EXTRACT_TIMESTAMP true
-  URL ${release_url}
-)
-
-FetchContent_GetProperties(msquic_release)
-if(NOT msquic_release_POPULATED)
-  FetchContent_Populate(msquic_release)
-endif()
-
-# import msquic as a cmake lib
-add_library(msquic SHARED IMPORTED GLOBAL)
-
-if(WIN32)
-set(_msquic_dll ${msquic_release_SOURCE_DIR}/bin/msquic.dll)
-set_target_properties(msquic PROPERTIES
-    IMPORTED_LOCATION ${_msquic_dll}
-    IMPORTED_IMPLIB ${msquic_release_SOURCE_DIR}/lib/msquic.lib
-)
-else()
-# glob msquic lib
-file(GLOB _msquic_dll 
-  ${msquic_release_SOURCE_DIR}/bin/libmsquic.so.*
-)
-message(STATUS "Found msquic lib: ${_msquic_dll}")
-set_target_properties(msquic PROPERTIES
-    IMPORTED_LOCATION ${_msquic_dll}
-)
-endif(WIN32)
-
-target_include_directories(msquic
-  INTERFACE ${msquic_release_SOURCE_DIR}/include
-)
+find_package(msquic CONFIG REQUIRED)
 
 # compile the example
 add_executable(quicsample
@@ -61,18 +31,9 @@ if(WIN32)
 target_link_libraries(quicsample
   PUBLIC msquic
 )
-add_custom_command(TARGET quicsample POST_BUILD
-    COMMAND ${CMAKE_COMMAND} 
-        -E copy_if_different ${_msquic_dll} ${CMAKE_CURRENT_BINARY_DIR}/Debug
-)
 else()
 target_link_libraries(quicsample
   PUBLIC msquic
-  OpenSSL::Crypto
-)
-add_custom_command(TARGET quicsample POST_BUILD
-    COMMAND ${CMAKE_COMMAND} 
-        -E copy_if_different ${_msquic_dll} ${CMAKE_CURRENT_BINARY_DIR}/libmsquic.so.2
 )
 endif()
 
@@ -85,7 +46,7 @@ endif()
 
 set(Boost_USE_STATIC_LIBS ON) # use static boost
 set(Boost_NO_WARN_NEW_VERSIONS ON)
-find_package(Boost REQUIRED)
+find_package(Boost REQUIRED log unit_test_framework headers)
 
 # third party oneshot asio lib
 message(STATUS "fetching ashtum_oneshot")

@@ -125,7 +125,7 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
       // printf("[conn][%p] Shut down by transport, 0x%x\n", Connection,
       //        Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status);
       MSQUIC_ASIO_MESSAGE(
-          "QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT error");
+          std::format("QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT error 0x{:x}", (std::uint32_t)Event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status));
     }
     //
     // The connection has been shut down by the transport. Generally, this
@@ -283,6 +283,7 @@ public:
         (void *)ctx_.get());
   }
 
+  // after listener accept, the config needs to be set.
   void set_config(native_handle_type config) {
     assert(this->is_open());
     this->api_->ConnectionSetConfiguration(this->h_, config);
